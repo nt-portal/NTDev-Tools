@@ -1,0 +1,8 @@
+# Artefak build (jangan di-commit)
+test/ntdev-tools.zip
+
+# Berkas sistem / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
