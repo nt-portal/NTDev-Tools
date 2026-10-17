@@ -52,7 +52,6 @@ Injeksi skrip hanya terjadi saat ikon bilah alat diklik (`manifest.json` tidak m
 - **Desain Mobile-First**: Target sentuh ergonomis, tata letak adaptif untuk layar sempit, serta dukungan penuh pengaman area seluler (`env(safe-area-inset-bottom)`).
 - **100% Ikon SVG**: Bebas dari simbol emoji Unicode; elemen antarmuka tajam di segala resolusi.
 - **Tanpa Dependensi Eksternal**: Berjalan ringan tanpa pustaka pihak ketiga yang membebani kinerja.
-- **Pencadangan Otomatis**: Setiap skrip `./build.sh` secara otomatis menyalin arsip rilis ke `/storage/emulated/0/Download/ntdev-tools.zip` (pada lingkungan Termux).
 
 ---
 
