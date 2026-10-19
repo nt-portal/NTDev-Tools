@@ -71,6 +71,44 @@ function sendToTab(tabId, message) {
   }
 }
 
+/**
+ * Mengirim pesan ke content script dan MEMPERTAHANKAN galat (tidak ditelan).
+ * Dipakai khusus oleh mekanisme retry: sendToTab menelan galat sehingga
+ * retry tidak akan pernah berjalan, sementara fungsi ini membiarkan Promise
+ * ditolak ketika listener content script belum siap (race condition pasca-injeksi).
+ * @param {number} tabId - ID tab tujuan
+ * @param {object} message - Objek pesan runtime yang akan dikirim
+ * @returns {Promise<*>}
+ */
+function sendToTabStrict(tabId, message) {
+  if (!browser.tabs || typeof browser.tabs.sendMessage !== "function") {
+    return Promise.reject(new Error("API browser.tabs.sendMessage tidak tersedia."));
+  }
+  try {
+    return Promise.resolve(browser.tabs.sendMessage(tabId, message));
+  } catch (e) {
+    return Promise.reject(e);
+  }
+}
+
+/**
+ * Menampilkan umpan balik error pada badge ikon toolbar dengan aman.
+ * Tidak pernah melempar bila API badge tidak tersedia (mis. varian browser lain).
+ * @param {number} tabId - ID tab yang badgenya diubah
+ * @param {string} text - Teks badge ("" untuk membersihkan)
+ * @param {string} [color] - Warna latar badge (opsional)
+ */
+function setBadge(tabId, text, color) {
+  try {
+    const api = browser.browserAction || browser.action;
+    if (!api) return;
+    if (typeof api.setBadgeText === "function") api.setBadgeText({ text: text, tabId: tabId });
+    if (color && typeof api.setBadgeBackgroundColor === "function") {
+      api.setBadgeBackgroundColor({ color: color, tabId: tabId });
+    }
+  } catch (e) {}
+}
+
 /* =========================================================================
    1. Sinkronisasi status panel yang dikirim oleh content script
    ========================================================================= */
@@ -131,6 +169,27 @@ function injectModulesSequentially(tabId, files) {
 }
 
 /**
+ * Mengirim pesan dengan retry logic untuk menghindari race condition saat injeksi.
+ * Memakai sendToTabStrict agar penolakan Promise benar-benar terdeteksi: setelah
+ * modul diinjeksi, listener content script bisa belum terdaftar sesaat, sehingga
+ * pesan pertama gagal. Percobaan diulang dengan jeda 200 ms hingga retries habis.
+ * @param {number} tabId - ID tab tujuan
+ * @param {boolean} visible - Status visibilitas
+ * @param {number} retries - Sisa percobaan
+ */
+function sendVisibilityWithRetry(tabId, visible, retries = 10) {
+  sendToTabStrict(tabId, { action: "setVisibility", visible: visible })
+    .catch(() => {
+      if (retries > 0) {
+        setTimeout(() => sendVisibilityWithRetry(tabId, visible, retries - 1), 200);
+      } else {
+        // Retry habis: tampilkan umpan balik error berupa badge.
+        setBadge(tabId, "!", "#e74c3c");
+      }
+    });
+}
+
+/**
  * Melakukan proses injeksi lengkap ke tab dan mengatur visibilitas panel konsol.
  * @param {number} tabId - ID tab target
  * @param {boolean} panelVisible - Status visibilitas awal panel
@@ -139,15 +198,15 @@ function doInject(tabId, panelVisible) {
   injectModulesSequentially(tabId, MDT_MODULES)
     .then(() => {
       injectedTabs.add(tabId);
-      // Beri jeda singkat agar contentScript.js selesai menyiapkan listener onMessage.
-      setTimeout(() => {
-        sendToTab(tabId, {
-          action: "setVisibility",
-          visible: panelVisible !== false
-        });
-      }, 100);
+      // Injeksi sukses: bersihkan umpan balik error sebelumnya pada badge.
+      setBadge(tabId, "", null);
+      sendVisibilityWithRetry(tabId, panelVisible !== false);
     })
-    .catch(e => console.warn("Injeksi NT DevTools gagal:", e));
+    .catch(e => {
+      console.warn("Injeksi NT DevTools gagal:", e);
+      // Umpan balik error berupa badge (aman bila API badge tidak tersedia).
+      setBadge(tabId, "!", "#e74c3c");
+    });
 }
 
 /* =========================================================================
@@ -545,17 +604,29 @@ if (browser.webRequest) {
   }
 
   // onHeadersReceived: menyimpan header balasan lalu memasang filter body (FASE 4).
-  // Didaftarkan "blocking" agar filterResponseData() dapat dipanggil (sesuai dokumen Firefox).
   if (browser.webRequest.onHeadersReceived && typeof browser.webRequest.onHeadersReceived.addListener === "function") {
-    browser.webRequest.onHeadersReceived.addListener((d) => {
-      if (d.tabId < 0) return;
-      const p = pending.get(d.requestId);
-      if (p) p.resHeaders = d.responseHeaders;
-      /* Hanya http/https, hanya bila opsi "Tangkap body respons" aktif. */
-      if (captureBody && isHttpUrl(d.url) && typeof browser.webRequest.filterResponseData === "function") {
-        try { attachResponseFilter(d.requestId, d.tabId); } catch (e) {}
-      }
-    }, { urls: ["<all_urls>"] }, ["responseHeaders", "blocking"]);
+    try {
+      browser.webRequest.onHeadersReceived.addListener((d) => {
+        if (d.tabId < 0) return;
+        const p = pending.get(d.requestId);
+        if (p) p.resHeaders = d.responseHeaders;
+        /* Hanya http/https, hanya bila opsi "Tangkap body respons" aktif. */
+        if (captureBody && isHttpUrl(d.url) && typeof browser.webRequest.filterResponseData === "function") {
+          try { attachResponseFilter(d.requestId, d.tabId); } catch (e) {}
+        }
+      }, { urls: ["<all_urls>"] }, ["responseHeaders", "blocking"]);
+    } catch (e) {
+      try {
+        browser.webRequest.onHeadersReceived.addListener((d) => {
+          if (d.tabId < 0) return;
+          const p = pending.get(d.requestId);
+          if (p) p.resHeaders = d.responseHeaders;
+          if (captureBody && isHttpUrl(d.url) && typeof browser.webRequest.filterResponseData === "function") {
+            try { attachResponseFilter(d.requestId, d.tabId); } catch (e) {}
+          }
+        }, { urls: ["<all_urls>"] }, ["responseHeaders"]);
+      } catch (e2) {}
+    }
   }
 
   // onCompleted: permintaan selesai; gabungkan seluruh data lalu kirim fase "done".

@@ -91,6 +91,10 @@ async function runTests() {
   console.log("  MDT_BEAUTIFY:", typeof win.MDT_BEAUTIFY);
   console.log("  listener onMessage terdaftar:", !!listeners.message);
   console.log("  readyState saat uji:", win.document.readyState);
+  /* Bridge: jembatan main world tidak wajib dalam harness JSDOM (csp dll),
+     tapi pastikan mekanisme bridge tidak menyebabkan galat. */
+  console.log("  window.__mdtBridgeInjected:", !!win.__mdtBridgeInjected);
+  console.log("  window.__mdtConsoleHooked:", !!win.__mdtConsoleHooked);
 
   console.log("\n=== Struktur DOM hasil injeksi ===");
   const root = $("#mdt-root");
@@ -187,12 +191,16 @@ async function runTests() {
     ok("panel nonaktif hilang dari topbar", netTabGone);
 
     /* Panel terakhir tidak boleh dimatikan: matikan semua kecuali about. */
-    for (const id of ["elements", "console", "sources", "perf", "storage", "ua"]) {
+    for (const id of ["elements", "console", "sources", "network", "perf", "storage", "ua"]) {
       const ck = $("#mdt-settings-scroll [data-setpanel='" + id + "']");
       if (ck && ck.checked) { ck.checked = false; ck.dispatchEvent(new win.Event("change", { bubbles: true })); }
     }
     const aboutCk = $("#mdt-settings-scroll [data-setpanel='about']");
     if (aboutCk) { aboutCk.checked = false; aboutCk.dispatchEvent(new win.Event("change", { bubbles: true })); }
+    const mapCk = $("#mdt-settings-scroll [data-setpanel='map']");
+    if (mapCk && mapCk.checked) { mapCk.checked = false; mapCk.dispatchEvent(new win.Event("change", { bubbles: true })); }
+    const timingCk = $("#mdt-settings-scroll [data-setpanel='timing']");
+    if (timingCk && timingCk.checked) { timingCk.checked = false; timingCk.dispatchEvent(new win.Event("change", { bubbles: true })); }
     ok("minimal satu panel tetap aktif", $$("#mdt-topbar [data-tab]").length >= 2, "(tab=" + $$("#mdt-topbar [data-tab]").length + ")");
     ok("tab Pengaturan tidak bisa dimatikan", !!$$("#mdt-topbar [data-tab]").find((b) => b.getAttribute("data-tab") === "settings"));
 
@@ -674,15 +682,21 @@ async function runTests() {
     }
   } catch (e) { fail++; console.log("  [GAGAL] edit teks melempar:", e && e.stack || e); }
 
-  console.log("\n=== Fase 3: salin HTML & selector ===");
+  console.log("\n=== Fase 3: tanda pohon VSCode, salin HTML & selector ===");
   try {
-    const appEl = win.document.getElementById("app");
     const row = selectById("app");
-    const menuBtn = row && row.querySelector(".mdt-dom-menubtn");
-    ok("tombol menu elemen ada", !!menuBtn);
-    if (menuBtn) menuBtn.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
+    /* Panah chevron buka/tutup bergaya VSCode (bukan tombol menu titik tiga). */
+    const chev = row && row.querySelector(".mdt-dtog svg");
+    ok("panah chevron buka/tutup ada pada baris elemen", !!chev);
+    /* Baris penutup </tag> bergaya VSCode. */
+    const closeRows = $$("#mdt-dom-tree .mdt-dclose");
+    ok("baris penutup </tag> bergaya VSCode ada",
+      closeRows.length > 0 && closeRows.some((r) => /^<\/[a-z0-9]+>$/i.test(r.textContent.trim())),
+      "(baris penutup=" + closeRows.length + ")");
+    /* Menu konteks dibuka lewat klik kanan / tekan lama (contextmenu). */
+    if (row) row.dispatchEvent(new win.MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
     const menu = $("#mdt-ctx-menu");
-    ok("menu konteks terbuka", !!menu);
+    ok("menu konteks terbuka lewat contextmenu", !!menu);
     const htmlItem = menu && Array.from(menu.querySelectorAll(".mdt-ctx-item")).find((i) => /Salin HTML/.test(i.textContent));
     const selItem = menu && Array.from(menu.querySelectorAll(".mdt-ctx-item")).find((i) => i.textContent === "Salin selector");
     ok("menu punya aksi Salin HTML (outerHTML)", !!htmlItem);

@@ -4,10 +4,10 @@
  * Berkas ini adalah "otak" antarmuka NT DevTools yang berjalan di dalam
  * setiap halaman web. Tugasnya:
  *   1. Memasukkan lembar gaya dari window.MDT_STYLES ke light DOM.
- *   2. Membangun seluruh kerangka antarmuka (topbar 8 tab, panel, FAB,
+ *   2. Membangun seluruh kerangka antarmuka (topbar, panel, FAB,
  *      overlay inspeksi) memakai id/kelas yang sudah didefinisikan styles.js.
  *   3. Menghubungkan setiap panel (Elemen, Konsol, Sumber, Jaringan,
- *      Kinerja, Aplikasi, Perangkat, Panduan, Cuplikan).
+ *      Kinerja, Aplikasi, Peta, Waktu, Perangkat, Tentang, Pengaturan).
  *   4. Menangani pesan runtime dari background.js
  *      (toggle / setVisibility / navigate / net).
  *
@@ -60,6 +60,110 @@
       ? chrome
       : null;
 
+  /* ==================================================================
+     BAGIAN 1b - Jembatan dunia utama (main world)
+     Console milik HALAMAN hanya dapat dicegat dari realm yang sama dengan
+     halaman. Karena MV2 di Firefox tidak menyediakan injeksi main world
+     lewat tabs.executeScript, injected.js disuntikkan sebagai elemen
+     <script src> lalu berkomunikasi balik lewat window.postMessage.
+
+     Status:
+       mainWorldBridge    -> true setelah dunia utama mengonfirmasi siap
+       evalSeq            -> penomoran perintah eval REPL
+       pendingEvals       -> id eval yang masih menunggu hasil
+       localHookHandlers  -> listener galat global saat memakai hook lokal
+     ================================================================== */
+  var mainWorldBridge = false;
+  var evalSeq = 0;
+  var pendingEvals = {};
+  var localHookHandlers = null;
+
+  /** Menyuntikkan injected.js ke dunia utama halaman sedini mungkin. */
+  function injectMainWorldBridge() {
+    try {
+      if (window.__mdtBridgeInjected) return;
+      var rt = null;
+      try {
+        if (typeof EXT !== "undefined" && EXT && EXT.runtime) rt = EXT.runtime;
+      } catch (e0) {}
+      if (!rt) {
+        if (typeof browser !== "undefined" && browser && browser.runtime) rt = browser.runtime;
+        else if (typeof chrome !== "undefined" && chrome && chrome.runtime) rt = chrome.runtime;
+      }
+      if (!rt || typeof rt.getURL !== "function") return;
+      window.__mdtBridgeInjected = true;
+      var s = document.createElement("script");
+      s.src = rt.getURL("injected.js");
+      s.async = false;
+      (document.head || document.documentElement).appendChild(s);
+      s.remove();
+    } catch (e) {
+      /* Bila CSP halaman menolak, hook lokal tetap dipakai sebagai cadangan. */
+    }
+  }
+
+  /** Menandai bahwa jembatan dunia utama aktif; hook lokal dilepas. */
+  function markMainWorldBridge() {
+    if (mainWorldBridge) return;
+    mainWorldBridge = true;
+    if (typeof uninstallLocalConsoleHooks === "function") {
+      try { uninstallLocalConsoleHooks(); } catch (e) {}
+    }
+  }
+
+  /** Menangani pesan dari dunia utama (konfirmasi, entri console, hasil eval). */
+  function onMainWorldMessage(event) {
+    var data = event && event.data;
+    if (!data || typeof data.source !== "string") return;
+    if (data.source === "mdt-console-ready") {
+      markMainWorldBridge();
+      return;
+    }
+    if (data.source === "mdt-console") {
+      markMainWorldBridge();
+      try {
+        if (data.method === "clear") clearLogs();
+        else applyConsoleCall(data.method || "log", Array.isArray(data.args) ? data.args : [], data.stack || "");
+      } catch (e) {}
+      return;
+    }
+    if (data.source === "mdt-eval-result") {
+      handleEvalResult(data);
+    }
+  }
+
+  /**
+   * Mengosongkan buffer log awal yang ditangkap bootstrap.js pada
+   * document_start (sebelum skrip ini termuat). Setelah diambil, buffer
+   * dijadikan null agar bootstrap berhenti menyimpan. Bila buffer berisi,
+   * jembatan dunia utama dianggap aktif sehingga hook lokal tidak dipakai.
+   */
+  function drainEarlyLogs() {
+    try {
+      var buf = window.__mdtEarlyLogs;
+      if (!Array.isArray(buf)) return;
+      window.__mdtEarlyLogs = null; /* hentikan buffering bootstrap */
+      for (var i = 0; i < buf.length; i++) {
+        var d = buf[i];
+        if (!d || d.source !== "mdt-console") continue;
+        try {
+          if (d.method === "clear") clearLogs();
+          else applyConsoleCall(d.method || "log", Array.isArray(d.args) ? d.args : [], d.stack || "");
+        } catch (e) {}
+      }
+      markMainWorldBridge();
+    } catch (e) {}
+  }
+
+  /* Suntikkan jembatan, kosongkan buffer log awal, lalu pasang penerima
+     pesan SEBELUM apa pun yang lain. */
+  injectMainWorldBridge();
+  drainEarlyLogs();
+  /* Bila bootstrap sudah menyuntik jembatan sebelum skrip ini dimuat, tandai
+     agar hook lokal tidak dipakai (mencegah entri ganda). */
+  if (window.__mdtBridgeInjected) markMainWorldBridge();
+  window.addEventListener("message", onMainWorldMessage);
+
   /* Namespace SVG. */
   var SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -72,6 +176,8 @@
     perf: "Kinerja",
     storage: "Aplikasi",
     ua: "Perangkat",
+    map: "Peta",
+    timing: "Waktu",
     about: "Tentang",
     settings: "Pengaturan"
   };
@@ -82,11 +188,42 @@
 
   /* Bila MDT_ICONS tidak tersedia, bangun daftar tab minimal agar UI tetap jadi. */
   if (!TABS.length) {
-    var IDS = ["elements", "console", "sources", "network", "perf", "storage", "ua", "about", "settings"];
+    var IDS = ["elements", "console", "sources", "network", "perf", "storage", "map", "timing", "ua", "about", "settings"];
     for (var ti = 0; ti < IDS.length; ti++) {
       TABS.push({ id: IDS[ti], label: TAB_LABELS[IDS[ti]] || IDS[ti], icon: [] });
     }
   }
+
+  /* Daftar kanonik seluruh modul yang dikenal. Kunci pengaturan pada
+     settings.panels memakai id yang SAMA persis dengan id modul di sini
+     (map, timing, dll) agar centang panel di Pengaturan selalu cocok. */
+  var ALL_TAB_IDS = ["elements", "console", "sources", "network", "perf", "storage", "map", "timing", "ua", "about", "settings"];
+
+  /* Ikon cadangan SVG (tanpa emoji) untuk modul yang belum punya ikon di
+     MDT_ICONS.TABS — khususnya Peta dan Waktu. */
+  var FALLBACK_TAB_ICONS = {
+    map: ["M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z", "C12,10,3"],
+    timing: ["C12,12,9", "M12 7v5l3 3"]
+  };
+
+  /* Pastikan SEMUA modul terdaftar di daftar tab walaupun MDT_ICONS belum
+     memuatnya (akar bug tab Peta & Waktu tidak muncul). Daftar disusun
+     ulang sesuai urutan kanonik agar posisinya stabil. */
+  (function ensureTabRegistry() {
+    var byId = {};
+    var i;
+    for (i = 0; i < TABS.length; i++) byId[TABS[i].id] = TABS[i];
+    var out = [];
+    for (var j = 0; j < ALL_TAB_IDS.length; j++) {
+      var id = ALL_TAB_IDS[j];
+      if (byId[id]) {
+        out.push(byId[id]);
+      } else {
+        out.push({ id: id, label: TAB_LABELS[id] || id, icon: FALLBACK_TAB_ICONS[id] || [] });
+      }
+    }
+    TABS = out;
+  })();
 
   /* ==================================================================
      BAGIAN 2 - Utilitas umum (pembuat elemen dan ikon SVG)
@@ -268,6 +405,8 @@
   var pickCursorEl, iovEl, ihlEl, itipEl;
 
   var logwrapEl, conFilterEl, conLevelsEl, conSettingsEl, regexBtnEl;
+  /* Kotak centang baris pengaturan inline konsol (diselaraskan dari panel Pengaturan). */
+  var conSettingsCbs = {};
   var replEl, replRunEl, logs = [], logMax = 500, autoscroll = true;
   /* Flag perilaku Konsol yang dikendalikan panel Pengaturan. */
   var showTime = false, groupLogs = false, showNonEnum = false, showGetters = false, renderAsync = false;
@@ -278,6 +417,7 @@
   var acEl = null, acItems = [], acIndex = -1, acOpen = false;
 
   var srcNavEl, srcFileTabsEl, srcCodeEl, srcStatusRightEl, srcSubTabsEl, srcPrettyBtnEl;
+  var srcEditBtnEl, srcRunBtnEl, srcEditTaEl, srcEditing = false;
   var srcTreeWrapEl, snippetsNavEl, snippetEditorWrapEl, snipTaEl, snipGutterEl, snipBarEl;
 
   var netListEl, netDetailEl, netDetailBodyEl, netDetailTabsEl, netFilterEl;
@@ -293,7 +433,6 @@
   var appCurrentStore = "localStorage", appData = [];
 
   var uaScrollEl, aboutScrollEl;
-  var guideDone = {};
 
   /* --- Status pengaturan (FASE 1: panel Pengaturan) --- */
   var settingsScrollEl, settingsEls = {};
@@ -313,17 +452,19 @@
 
   /* Daftar id panel yang bisa dinyalakan/dimatikan dari Pengaturan.
      Tab "settings" sendiri tidak disertakan (selalu aktif). */
-  var CONFIG_PANELS = ["elements", "console", "sources", "network", "perf", "storage", "ua", "about"];
+  var CONFIG_PANELS = ["elements", "console", "sources", "network", "perf", "storage", "map", "timing", "ua", "about"];
 
   function defaultSettings() {
     return {
-      theme: "dark",          /* "dark" | "light" */
-      opacity: 0.92,          /* transparansi panel #mdt-root (0.5 - 1) */
-      heightVh: 55,           /* tinggi panel dalam vh (30 - 95) */
+      theme: "system",        /* "system" | "dark" | "light" (baku: Bawaan Sistem) */
+      opacity: 0.9,           /* transparansi panel #mdt-root (0.5 - 1) */
+      heightVh: 50,           /* tinggi panel dalam vh (30 - 95) */
       fontSize: 12,           /* ukuran font panel (10 - 16 px) */
       panels: {
         elements: true, console: true, sources: true, network: true,
-        perf: true, storage: true, ua: true, about: true
+        perf: true, storage: true, ua: true, about: true,
+        /* Peta dan Waktu NONAKTIF secara baku (sesuai permintaan). */
+        map: false, timing: false
       },
       console: {
         autoscroll: true,
@@ -361,7 +502,7 @@
   /** Menggabungkan data tersimpan ke model, hanya kunci yang dikenal. */
   function mergeSettings(src) {
     if (!src || typeof src !== "object") return;
-    if (src.theme === "light" || src.theme === "dark") settings.theme = src.theme;
+    if (src.theme === "light" || src.theme === "dark" || src.theme === "system") settings.theme = src.theme;
     settings.opacity = clampNum(src.opacity, 0.5, 1, settings.opacity);
     settings.heightVh = clampNum(src.heightVh, 30, 95, settings.heightVh);
     settings.fontSize = clampNum(src.fontSize, 10, 16, settings.fontSize);
@@ -391,12 +532,14 @@
       if (typeof src.network.captureBody === "boolean") settings.network.captureBody = src.network.captureBody;
     }
 
-    /* Jamin minimal satu panel penyusun tetap aktif. */
-    var any = false;
+    /* Jamin minimal satu panel penyusun tetap aktif selain Settings. */
+    var activeCount = 0;
     for (var k = 0; k < CONFIG_PANELS.length; k++) {
-      if (settings.panels[CONFIG_PANELS[k]]) any = true;
+      if (settings.panels[CONFIG_PANELS[k]]) activeCount++;
     }
-    if (!any) settings.panels.elements = true;
+    if (activeCount < 1) {
+      settings.panels[CONFIG_PANELS[0]] = true;
+    }
   }
 
   /** Apakah sebuah panel tampil di topbar. Tab settings selalu tampil. */
@@ -458,6 +601,35 @@
     } catch (e) {}
   }
 
+  /**
+   * Memantau perubahan pengaturan lewat storage.onChanged (tab/konteks lain
+   * maupun tombol reset). Setiap modul memperbarui diri SEKETIKA tanpa
+   * perlu memuat ulang panel.
+   */
+  function watchSettingsStorage() {
+    try {
+      if (!EXT || !EXT.storage || !EXT.storage.onChanged || !EXT.storage.onChanged.addListener) return;
+      EXT.storage.onChanged.addListener(function (changes, area) {
+        try {
+          if (area !== "local" || !changes || !Object.prototype.hasOwnProperty.call(changes, SETTINGS_KEY)) return;
+          var nv = changes[SETTINGS_KEY] ? changes[SETTINGS_KEY].newValue : null;
+          if (!nv) return;
+          /* Abaikan bila nilai identik (hindari penyegaran tanpa guna). */
+          try {
+            if (JSON.stringify(cloneSettings(settings)) === JSON.stringify(nv)) return;
+          } catch (e) {}
+          mergeSettings(nv);
+          applySettings();      /* tampilan + tab + modul konsol */
+          syncSettingsUI();     /* kontrol panel Pengaturan */
+        } catch (e) {
+          /* abaikan perubahan rusak */
+        }
+      });
+    } catch (e) {
+      /* abaikan bila API storage tidak tersedia */
+    }
+  }
+
   /** Menyalin nilai pengaturan ke variabel modul yang dipakai panel lain. */
   function applyConsoleSettings() {
     autoscroll = !!settings.console.autoscroll;
@@ -470,6 +642,46 @@
     filterRegex = !!settings.console.regex;
     if (regexBtnEl) regexBtnEl.classList.toggle("on", filterRegex);
     if (conFilterEl) conFilterEl.setAttribute("placeholder", filterRegex ? "Saring log (regex)" : "Saring log");
+    /* Perbarui kotak centang inline konsol tanpa memuat ulang panel. */
+    syncConsoleSettingsUI();
+  }
+
+  /** Menyelaraskan baris pengaturan inline konsol dengan nilai terkini. */
+  function syncConsoleSettingsUI() {
+    try {
+      if (conSettingsCbs.autoscroll) conSettingsCbs.autoscroll.checked = !!autoscroll;
+      if (conSettingsCbs.timestamps) conSettingsCbs.timestamps.checked = !!showTime;
+      if (conSettingsCbs.groups) conSettingsCbs.groups.checked = !!groupLogs;
+      if (regexBtnEl) regexBtnEl.classList.toggle("on", filterRegex);
+      if (conFilterEl) conFilterEl.setAttribute("placeholder", filterRegex ? "Saring log (regex)" : "Saring log");
+    } catch (e) {
+      /* abaikan bila antarmuka konsol belum dibangun */
+    }
+  }
+
+  /** Apakah sistem operasi meminta skema terang (untuk tema "Bawaan Sistem"). */
+  function systemPrefersLight() {
+    try {
+      if (typeof window.matchMedia === "function") {
+        return window.matchMedia("(prefers-color-scheme: light)").matches;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  /** Memantau perubahan skema warna sistem agar tema "Bawaan Sistem" ikut berubah. */
+  function watchSystemTheme() {
+    try {
+      if (typeof window.matchMedia !== "function") return;
+      var mq = window.matchMedia("(prefers-color-scheme: light)");
+      var handler = function () {
+        if (settings.theme === "system") applySettings();
+      };
+      if (mq.addEventListener) mq.addEventListener("change", handler);
+      else if (mq.addListener) mq.addListener(handler);
+    } catch (e) {
+      /* abaikan bila matchMedia tidak mendukung listener */
+    }
   }
 
   /**
@@ -479,7 +691,8 @@
   function applySettings() {
     applyConsoleSettings();
     if (!rootEl) return;
-    rootEl.classList.toggle("mdt-light", settings.theme === "light");
+    var lightOn = settings.theme === "light" || (settings.theme === "system" && systemPrefersLight());
+    rootEl.classList.toggle("mdt-light", lightOn);
     rootEl.style.opacity = String(settings.opacity);
     rootEl.style.height = settings.heightVh + "vh";
     rootEl.style.minHeight = "0";
@@ -504,6 +717,9 @@
   function populateTopbar() {
     if (!topbarEl) return;
     topbarEl.textContent = "";
+    /* Bilah tab dapat digulir horizontal agar label tidak terpotong. */
+    topbarEl.style.overflowX = "auto";
+    topbarEl.style.flexShrink = "0";
 
     for (var i = 0; i < TABS.length; i++) {
       (function (tab) {
@@ -512,9 +728,13 @@
         var btn = el("button", "mdt-tab");
         btn.type = "button";
         btn.setAttribute("data-tab", tab.id);
+        /* Tombol tidak boleh menyusut agar label tetap utuh. */
+        btn.style.flexShrink = "0";
         if (tab.id === currentTab) btn.classList.add("on");
         if (tab.icon && tab.icon.length) btn.appendChild(svgIcon(tab.icon, 13));
-        btn.appendChild(el("span", null, TAB_LABELS[tab.id] || tab.label || tab.id));
+        var lbl = el("span", null, TAB_LABELS[tab.id] || tab.label || tab.id);
+        lbl.style.whiteSpace = "nowrap";
+        btn.appendChild(lbl);
         btn.addEventListener("click", function () {
           activateTab(tab.id);
         });
@@ -522,10 +742,20 @@
       })(TABS[i]);
     }
 
-    var closeBtn = el("button", null, "Tutup");
+    /* Tombol tutup memakai ikon X SVG dengan area sentuh minimal 40 px. */
+    var closeBtn = el("button", null);
     closeBtn.id = "mdt-closebtn";
     closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "Tutup");
     closeBtn.setAttribute("title", "Tutup NT DevTools");
+    closeBtn.style.display = "inline-flex";
+    closeBtn.style.alignItems = "center";
+    closeBtn.style.justifyContent = "center";
+    closeBtn.style.minWidth = "40px";
+    closeBtn.style.minHeight = "40px";
+    closeBtn.style.padding = "0 12px";
+    closeBtn.style.lineHeight = "normal";
+    closeBtn.appendChild(svgIcon(["M18 6L6 18", "M6 6l12 12"], 16));
     closeBtn.addEventListener("click", function () {
       setVisible(false);
     });
@@ -726,6 +956,8 @@
     else if (id === "network" && built.network) ensureNetInit();
     else if (id === "storage" && built.storage) renderAppTable();
     else if (id === "ua" && built.ua) renderDevice();
+    else if (id === "map" && built.map) refreshMapPanel();
+    else if (id === "timing" && built.timing) refreshTimingPanel();
   }
 
   /* Peta fungsi pembangun tiap panel. */
@@ -736,6 +968,8 @@
     network: buildNetwork,
     perf: buildPerformance,
     storage: buildStorage,
+    map: buildMapPanel,
+    timing: buildTimingPanel,
     ua: buildDevice,
     about: buildAbout,
     settings: buildSettings
@@ -802,15 +1036,20 @@
 
     /* --- Toolbar atas --- */
     var tb = el("div", "mdt-toolbar");
+    /* Toolbar membungkus dan tombol tidak menyusut agar tidak terpotong. */
+    tb.style.flexWrap = "wrap";
 
     pickBtnEl = el("button", "mdt-tbtn mdt-pick-btn", "Pilih");
     pickBtnEl.type = "button";
+    pickBtnEl.style.flexShrink = "0";
+    pickBtnEl.style.whiteSpace = "nowrap";
     pickBtnEl.setAttribute("title", "Pilih elemen di halaman");
     pickBtnEl.addEventListener("click", togglePick);
     tb.appendChild(pickBtnEl);
 
     domSearchEl = el("input", "mdt-tbinput");
     domSearchEl.id = "mdt-dom-search";
+    domSearchEl.style.minWidth = "120px";
     domSearchEl.setAttribute("placeholder", "Cari tag atau #id .kelas");
     domSearchEl.addEventListener("input", function () {
       filterDomTree(domSearchEl.value);
@@ -822,6 +1061,8 @@
 
     var refreshBtn = el("button", "mdt-tbtn", "Muat ulang");
     refreshBtn.type = "button";
+    refreshBtn.style.flexShrink = "0";
+    refreshBtn.style.whiteSpace = "nowrap";
     refreshBtn.setAttribute("title", "Bangun ulang pohon DOM");
     refreshBtn.addEventListener("click", renderDomTree);
     tb.appendChild(refreshBtn);
@@ -830,6 +1071,8 @@
     var autoBtn = el("button", "mdt-tbtn mdt-dom-auto" + (domAutoUpdate ? " on" : ""), "Auto");
     autoBtn.id = "mdt-dom-auto";
     autoBtn.type = "button";
+    autoBtn.style.flexShrink = "0";
+    autoBtn.style.whiteSpace = "nowrap";
     autoBtn.setAttribute("title", "Perbarui pohon DOM otomatis saat halaman berubah");
     autoBtn.addEventListener("click", function () {
       setDomAutoUpdate(!domAutoUpdate);
@@ -839,6 +1082,8 @@
 
     var sideBtn = el("button", "mdt-tbtn", "Gaya");
     sideBtn.type = "button";
+    sideBtn.style.flexShrink = "0";
+    sideBtn.style.whiteSpace = "nowrap";
     sideBtn.setAttribute("title", "Tampilkan/sembunyikan panel gaya");
     sideBtn.addEventListener("click", function () {
       if (domSideEl) domSideEl.classList.toggle("on");
@@ -935,6 +1180,34 @@
     if (selectedEl && domRowMap.has(selectedEl)) markSelectedRow(selectedEl);
   }
 
+  /* Node internal ekstensi yang disembunyikan dari pohon DOM. */
+  var INTERNAL_NODE_IDS = ["mdt-root", "mdt-fab", "mdt-iov", "mdt-ihl", "mdt-itip", "mdt-pick-cursor"];
+
+  /** Apakah node merupakan bagian antarmuka internal NT DevTools. */
+  function isInternalNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var id = node.id || "";
+    return id && INTERNAL_NODE_IDS.indexOf(id) >= 0;
+  }
+
+  /** Apakah node punya anak yang layak ditampilkan (mengabaikan node internal). */
+  function hasChildNodes(node) {
+    var c = node.firstChild;
+    while (c) {
+      if (!(c.nodeType === 1 && isInternalNode(c))) return true;
+      c = c.nextSibling;
+    }
+    return false;
+  }
+
+  /** Mengatur status panah buka/tutup bergaya VSCode (rotate SVG). */
+  function setTogState(tog, open) {
+    if (!tog) return;
+    tog.classList.toggle("open", !!open);
+    var svg = tog.querySelector ? tog.querySelector("svg") : null;
+    if (svg) svg.style.transform = open ? "rotate(90deg)" : "rotate(0deg)";
+  }
+
   /** Membuat fragmen baris untuk satu node elemen beserta wadah anaknya. */
   function makeDomNode(node, depth, expand) {
     var frag = document.createDocumentFragment();
@@ -943,13 +1216,31 @@
     var wrap = el("div");
     wrap.style.display = expand ? "block" : "none";
 
-    var entry = { row: row, wrap: wrap, built: false, expanded: !!expand, tog: row.__tog };
+    var kids = hasChildNodes(node);
+    var closeRow = null;
+    if (kids) {
+      /* Baris penutup </tag> bergaya VSCode, sejajar dengan tag pembuka. */
+      closeRow = el("div", "mdt-dclose", "</" + node.tagName.toLowerCase() + ">");
+      closeRow.style.paddingLeft = depth * 12 + 16 + "px";
+      closeRow.style.display = expand ? "flex" : "none";
+      closeRow.style.whiteSpace = "pre-wrap";
+      closeRow.style.wordBreak = "break-word";
+      closeRow.style.overflowWrap = "anywhere";
+      closeRow.style.maxWidth = "100%";
+      closeRow.style.boxSizing = "border-box";
+      closeRow.style.height = "auto";
+      closeRow.style.minHeight = "18px";
+    }
+
+    var entry = { row: row, wrap: wrap, closeRow: closeRow, built: false, expanded: !!expand, tog: row.__tog };
     domRowMap.set(node, entry);
 
     frag.appendChild(row);
     frag.appendChild(wrap);
+    if (closeRow) frag.appendChild(closeRow);
 
     if (expand) buildDomChildren(node, wrap, depth);
+    setTogState(row.__tog, !!expand);
     return frag;
   }
 
@@ -957,13 +1248,29 @@
   function createElementRow(node, depth) {
     var row = el("div", "mdt-drow2");
     row.style.paddingLeft = depth * 12 + 4 + "px";
+    /* Baris tag membungkus dan tidak melebihi lebar layar. */
+    row.style.whiteSpace = "pre-wrap";
+    row.style.wordBreak = "break-word";
+    row.style.overflowWrap = "anywhere";
+    row.style.maxWidth = "100%";
+    row.style.boxSizing = "border-box";
+    row.style.height = "auto";
+    row.style.minHeight = IS_MOBILE ? "20px" : "18px";
+    row.style.alignItems = "flex-start";
+    row.style.paddingTop = "1px";
+    row.style.paddingBottom = "1px";
 
-    var kids = node.childNodes ? node.childNodes.length : 0;
-    var tog = el("span", kids ? "mdt-dtog" : "mdt-dnotog", kids ? "-" : "");
+    var kids = hasChildNodes(node);
+    var tog = el("span", kids ? "mdt-dtog" : "mdt-dnotog");
     row.appendChild(tog);
     row.__tog = tog;
 
     if (kids) {
+      /* Panah buka/tutup bergaya VSCode (chevron SVG, bukan teks + / -). */
+      var chev = svgIcon(["M9 6l6 6-6 6"], 10);
+      chev.style.display = "block";
+      chev.style.transition = "transform .12s";
+      tog.appendChild(chev);
       tog.addEventListener("click", function (ev) {
         ev.stopPropagation();
         toggleDomNode(node);
@@ -997,18 +1304,17 @@
     });
     row.appendChild(addAttrBtn);
 
-    /* Tombol menu kecil di sisi kanan. */
-    var menu = el("button", "mdt-dom-menubtn", "...");
-    menu.type = "button";
-    menu.setAttribute("title", "Menu elemen");
-    menu.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      openCtxMenu(ev, node);
-    });
-    row.appendChild(menu);
-
     row.addEventListener("click", function () {
       selectElement(node);
+    });
+
+    /* Menu konteks dibuka lewat klik kanan (atau tekan lama di Android,
+       yang memicu peristiwa contextmenu). */
+    row.addEventListener("contextmenu", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      selectElement(node);
+      openCtxMenu(ev, node);
     });
 
     return row;
@@ -1156,6 +1462,11 @@
         break;
       }
       if (child.nodeType === 1) {
+        if (isInternalNode(child)) {
+          /* Lewati node internal ekstensi (mdt-root, mdt-fab, dst). */
+          child = child.nextSibling;
+          continue;
+        }
         wrap.appendChild(makeDomNode(child, depth + 1, false));
       } else if (child.nodeType === 3) {
         var txt = (child.nodeValue || "").trim();
@@ -1204,7 +1515,8 @@
     }
     entry.expanded = !entry.expanded;
     entry.wrap.style.display = entry.expanded ? "block" : "none";
-    if (entry.tog) entry.tog.textContent = entry.expanded ? "-" : "+";
+    if (entry.closeRow) entry.closeRow.style.display = entry.expanded ? "flex" : "none";
+    setTogState(entry.tog, entry.expanded);
   }
 
   /** Menghitung kedalaman node relatif terhadap documentElement. */
@@ -1242,7 +1554,8 @@
     if (!entry.expanded) {
       entry.expanded = true;
       entry.wrap.style.display = "block";
-      if (entry.tog) entry.tog.textContent = "-";
+      if (entry.closeRow) entry.closeRow.style.display = "flex";
+      setTogState(entry.tog, true);
     }
   }
 
@@ -2119,21 +2432,25 @@
     /* --- Baris pengaturan (collapsible) --- */
     conSettingsEl = el("div");
     conSettingsEl.id = "mdt-con-settings";
+    conSettingsCbs = {};
     var checks = [
       ["Autoscroll", autoscroll, function (v) {
-        autoscroll = v;
         settings.console.autoscroll = v;
+        applyConsoleSettings();
         saveSettings();
+        syncSettingsUI();
       }],
       ["Tampilkan waktu", showTime, function (v) {
-        showTime = v;
         settings.console.timestamps = v;
+        applyConsoleSettings();
         saveSettings();
+        syncSettingsUI();
       }],
       ["Grup serupa", groupLogs, function (v) {
-        groupLogs = v;
         settings.console.groups = v;
+        applyConsoleSettings();
         saveSettings();
+        syncSettingsUI();
       }]
     ];
     for (var i = 0; i < checks.length; i++) {
@@ -2148,6 +2465,10 @@
         lk.appendChild(cb);
         lk.appendChild(el("span", null, c[0]));
         conSettingsEl.appendChild(lk);
+        /* Simpan referensi agar bisa diselaraskan dari panel Pengaturan. */
+        if (c[0] === "Autoscroll") conSettingsCbs.autoscroll = cb;
+        else if (c[0] === "Tampilkan waktu") conSettingsCbs.timestamps = cb;
+        else if (c[0] === "Grup serupa") conSettingsCbs.groups = cb;
       })(checks[i]);
     }
     outer.appendChild(conSettingsEl);
@@ -2155,9 +2476,12 @@
     /* --- Toolbar utama --- */
     var tb = el("div");
     tb.id = "mdt-con-toolbar";
+    tb.style.flexWrap = "wrap";
 
     var clearBtn = el("button", "mdt-con-tbtn", "Bersihkan");
     clearBtn.type = "button";
+    clearBtn.style.flexShrink = "0";
+    clearBtn.style.whiteSpace = "nowrap";
     clearBtn.addEventListener("click", clearLogs);
     tb.appendChild(clearBtn);
 
@@ -2165,6 +2489,7 @@
 
     conLevelsEl = el("select");
     conLevelsEl.id = "mdt-con-levels";
+    conLevelsEl.style.flexShrink = "0";
     var levels = [
       ["all", "Semua"],
       ["log", "Log"],
@@ -2182,6 +2507,7 @@
 
     conFilterEl = el("input");
     conFilterEl.id = "mdt-con-filter";
+    conFilterEl.style.minWidth = "0";
     conFilterEl.setAttribute("placeholder", filterRegex ? "Saring log (regex)" : "Saring log");
     conFilterEl.addEventListener("input", applyLogFilter);
     tb.appendChild(conFilterEl);
@@ -2190,6 +2516,7 @@
     regexBtnEl = el("button", "mdt-con-tbtn" + (filterRegex ? " on" : ""), ".*");
     regexBtnEl.id = "mdt-con-regex";
     regexBtnEl.type = "button";
+    regexBtnEl.style.flexShrink = "0";
     regexBtnEl.setAttribute("title", "Saring memakai regex");
     regexBtnEl.addEventListener("click", function () {
       filterRegex = !filterRegex;
@@ -2208,6 +2535,9 @@
 
     var setBtn = el("button", "mdt-con-tbtn", "Setelan");
     setBtn.type = "button";
+    /* Tombol Setelan tidak boleh terpotong. */
+    setBtn.style.flexShrink = "0";
+    setBtn.style.whiteSpace = "nowrap";
     setBtn.addEventListener("click", function () {
       conSettingsEl.classList.toggle("open");
       setBtn.classList.toggle("on");
@@ -2232,8 +2562,12 @@
     replEl = el("textarea");
     replEl.id = "mdt-repl";
     replEl.setAttribute("rows", "1");
-    replEl.setAttribute("placeholder", "Evaluasi JavaScript (mis. document.title, $0.tagName, $('p'))");
+    /* Placeholder pendek + satu baris agar tidak terpotong dua baris. */
+    replEl.setAttribute("placeholder", "Evaluasi JS…");
     replEl.setAttribute("spellcheck", "false");
+    replEl.style.whiteSpace = "nowrap";
+    replEl.style.overflow = "hidden";
+    replEl.style.textOverflow = "ellipsis";
     replEl.addEventListener("keydown", function (e) {
       /* Navigasi pelengkapan otomatis lebih dulu (Arrow/Enter/Tab/Esc). */
       if (acKeydown(e)) return;
@@ -2299,130 +2633,154 @@
     return Math.round(d * 1000) / 1000;
   }
 
-  /** Memasang pencegat pada console.* dan penangan galat global. */
-  function installConsoleHooks() {
+  /**
+   * Menerapkan satu pemanggilan console.* ke area log.
+   * Dipakai bersama oleh hook lokal (dunia terisolasi, cadangan) dan oleh
+   * pesan yang datang dari jembatan dunia utama.
+   * @param {string} method - Nama metode console (log, group, clear, ...)
+   * @param {Array} args - Daftar argumen yang sudah aman
+   * @param {string} [stack] - Jejak tumpukan bila ada
+   */
+  function applyConsoleCall(method, args, stack) {
+    args = Array.isArray(args) ? args : [];
+    stack = stack || "";
+    switch (method) {
+      case "log":
+      case "info":
+      case "warn":
+      case "error":
+      case "debug":
+        addLog(method, args, stack);
+        return;
+      case "table":
+        addLog("log", ["Tabel:"].concat(args), stack);
+        return;
+      case "dir":
+        addLog("log", args, stack);
+        return;
+      case "time":
+        consoleTimers[conLabel(args[0])] = nowMs();
+        return;
+      case "timeLog": {
+        var key = conLabel(args[0]);
+        addLog("log", [key + ": " + conElapsed(key) + " ms"].concat(args.slice(1)), stack);
+        return;
+      }
+      case "timeEnd": {
+        var keyEnd = conLabel(args[0]);
+        var ms = conElapsed(keyEnd);
+        delete consoleTimers[keyEnd];
+        addLog("log", [keyEnd + ": " + ms + " ms"], stack);
+        return;
+      }
+      case "assert": {
+        var truthy = true;
+        try { truthy = !!args[0]; } catch (e) { truthy = false; }
+        if (!truthy) addLog("error", ["Assertion gagal:"].concat(args.slice(1)), stack, { stack: true });
+        return;
+      }
+      case "count": {
+        var keyCount = conLabel(args[0]);
+        consoleCounts[keyCount] = (consoleCounts[keyCount] || 0) + 1;
+        addLog("log", [keyCount + ": " + consoleCounts[keyCount]], stack);
+        return;
+      }
+      case "countReset":
+        consoleCounts[conLabel(args[0])] = 0;
+        return;
+      case "trace":
+        addLog("log", ["Jejak tumpukan"].concat(args), stack, { stack: true });
+        return;
+      case "group":
+      case "groupCollapsed":
+        addLog("log", args.length ? args : ["Grup"], stack);
+        groupDepth++;
+        return;
+      case "groupEnd":
+        if (groupDepth > 0) groupDepth--;
+        return;
+      case "clear":
+        clearLogs();
+        return;
+      default:
+        addLog("log", args, stack);
+    }
+  }
+
+  /**
+   * Memasang pencegat LOKAL pada console.* (dunia terisolasi).
+   * Hanya dipakai sebagai cadangan bila jembatan dunia utama tidak tersedia
+   * (mis. CSP halaman menolak <script src>). Hook ini tidak dapat melihat
+   * log skrip halaman, karena itu jembatan main world lebih diutamakan.
+   */
+  function installLocalConsoleHooks() {
     if (origConsole.log) return; /* sudah terpasang */
 
-    /* Tingkat dasar: log/info/warn/error/debug (perilaku lama dipertahankan). */
-    var levels = ["log", "info", "warn", "error", "debug"];
-    for (var i = 0; i < levels.length; i++) {
-      (function (level) {
-        var pass = hookNative(level);
-        console[level] = function mdtConsoleHook() {
+    var methods = [
+      "log", "info", "warn", "error", "debug", "table", "dir",
+      "time", "timeLog", "timeEnd", "assert", "count", "countReset",
+      "trace", "group", "groupCollapsed", "groupEnd", "clear"
+    ];
+    for (var i = 0; i < methods.length; i++) {
+      (function (method) {
+        var pass = hookNative(method);
+        console[method] = function mdtConsoleHook() {
           var args = pass.apply(null, arguments);
-          addLog(level, args, captureStack());
+          try {
+            applyConsoleCall(method, args, captureStack());
+          } catch (e) {}
         };
-      })(levels[i]);
+      })(methods[i]);
     }
 
-    /* console.table: tampilkan data sebagai pohon objek. */
-    var passTable = hookNative("table");
-    console.table = function mdtConsoleTable() {
-      var args = passTable.apply(null, arguments);
-      addLog("log", ["Tabel:"].concat(args), captureStack());
-    };
-
-    /* console.dir: tampilkan objek apa adanya sebagai pohon. */
-    var passDir = hookNative("dir");
-    console.dir = function mdtConsoleDir() {
-      var args = passDir.apply(null, arguments);
-      addLog("log", args, captureStack());
-    };
-
-    /* console.time / timeLog / timeEnd: ukur dan tampilkan durasi. */
-    hookNative("time");
-    console.time = function mdtConsoleTime(label) {
-      consoleTimers[conLabel(label)] = nowMs();
-    };
-    hookNative("timeLog");
-    console.timeLog = function mdtConsoleTimeLog(label) {
-      var args = Array.prototype.slice.call(arguments);
-      var key = conLabel(label);
-      var extra = args.slice(1);
-      addLog("log", [key + ": " + conElapsed(key) + " ms"].concat(extra), captureStack());
-    };
-    hookNative("timeEnd");
-    console.timeEnd = function mdtConsoleTimeEnd(label) {
-      var key = conLabel(label);
-      var ms = conElapsed(key);
-      delete consoleTimers[key];
-      addLog("log", [key + ": " + ms + " ms"], captureStack());
-    };
-
-    /* console.assert: catat entri galat bila pernyataan bernilai salah. */
-    var passAssert = hookNative("assert");
-    console.assert = function mdtConsoleAssert(cond) {
-      var args = Array.prototype.slice.call(arguments);
-      try {
-        passAssert.apply(null, args);
-      } catch (e) {}
-      var truthy = true;
-      try {
-        truthy = !!cond;
-      } catch (e2) {
-        truthy = false;
-      }
-      if (!truthy) {
-        addLog("error", ["Assertion gagal:"].concat(args.slice(1)), captureStack(), { stack: true });
+    /* Penangan galat global dipasang hanya pada mode cadangan, sebab
+       main world juga memasangnya dan peristiwa window dibagi ke semua
+       realm (bila keduanya aktif, entri akan ganda). */
+    localHookHandlers = {
+      onError: function (event) {
+        try {
+          var msg = event && event.message ? event.message : String(event);
+          var loc = event && event.filename ? (event.filename + ":" + event.lineno) : "";
+          addLog("error", ["Uncaught Error: " + msg, loc], captureStack(), { stack: true });
+        } catch (e) {}
+      },
+      onRejection: function (e) {
+        try {
+          var r = e && e.reason;
+          var stk = r && r.stack ? r.stack : captureStack();
+          addLog("error", ["Unhandled promise rejection:", r], stk, { stack: true });
+        } catch (e2) {}
       }
     };
+    window.addEventListener("error", localHookHandlers.onError);
+    window.addEventListener("unhandledrejection", localHookHandlers.onRejection);
+  }
 
-    /* console.count / countReset: penghitung berlabel. */
-    hookNative("count");
-    console.count = function mdtConsoleCount(label) {
-      var key = conLabel(label);
-      consoleCounts[key] = (consoleCounts[key] || 0) + 1;
-      addLog("log", [key + ": " + consoleCounts[key]], captureStack());
-    };
-    hookNative("countReset");
-    console.countReset = function mdtConsoleCountReset(label) {
-      consoleCounts[conLabel(label)] = 0;
-    };
+  /** Melepas hook lokal dan memulihkan console asli saat jembatan aktif. */
+  function uninstallLocalConsoleHooks() {
+    if (!origConsole.log && !localHookHandlers) return;
+    for (var m in origConsole) {
+      if (Object.prototype.hasOwnProperty.call(origConsole, m)) {
+        try { console[m] = origConsole[m]; } catch (e) {}
+      }
+    }
+    origConsole = {};
+    if (localHookHandlers) {
+      try { window.removeEventListener("error", localHookHandlers.onError); } catch (e2) {}
+      try { window.removeEventListener("unhandledrejection", localHookHandlers.onRejection); } catch (e3) {}
+      localHookHandlers = null;
+    }
+  }
 
-    /* console.trace: selalu sertakan jejak tumpukan. */
-    var passTrace = hookNative("trace");
-    console.trace = function mdtConsoleTrace() {
-      var args = passTrace.apply(null, arguments);
-      addLog("log", ["Jejak tumpukan"].concat(args), captureStack(), { stack: true });
-    };
-
-    /* console.group / groupCollapsed / groupEnd: indentasi entri berikutnya. */
-    hookNative("group");
-    console.group = function mdtConsoleGroup() {
-      var args = Array.prototype.slice.call(arguments);
-      addLog("log", args.length ? args : ["Grup"], captureStack());
-      groupDepth++;
-    };
-    hookNative("groupCollapsed");
-    console.groupCollapsed = function mdtConsoleGroupCollapsed() {
-      var args = Array.prototype.slice.call(arguments);
-      addLog("log", args.length ? args : ["Grup"], captureStack());
-      groupDepth++;
-    };
-    hookNative("groupEnd");
-    console.groupEnd = function mdtConsoleGroupEnd() {
-      if (groupDepth > 0) groupDepth--;
-    };
-
-    /* console.clear: bersihkan area log konsol. */
-    hookNative("clear");
-    console.clear = function mdtConsoleClear() {
-      try {
-        origConsole.clear();
-      } catch (e) {}
-      clearLogs();
-    };
-
-    window.addEventListener("error", function (e) {
-      var msg = e.message + " (" + (e.filename || "") + ":" + (e.lineno || 0) + ")";
-      var stk = e.error && e.error.stack ? e.error.stack : captureStack();
-      addLog("error", [msg], stk, { stack: true });
-    });
-    window.addEventListener("unhandledrejection", function (e) {
-      var r = e && e.reason;
-      var stk = r && r.stack ? r.stack : captureStack();
-      addLog("error", ["Unhandled promise rejection:", r], stk, { stack: true });
-    });
+  /**
+   * Memasang pencegat console. Bila jembatan dunia utama sudah aktif, hook
+   * lokal TIDAK dipasang (mencegah entri ganda). Bila belum, hook lokal
+   * dipasang sebagai cadangan dan akan dilepas begitu jembatan siap.
+   */
+  function installConsoleHooks() {
+    if (origConsole.log || localHookHandlers) return; /* sudah terpasang */
+    if (mainWorldBridge) return;                      /* biarkan dunia utama */
+    installLocalConsoleHooks();
   }
 
   /** Mengambil jejak tumpukan multi-baris, tanpa bingkai internal. */
@@ -2928,13 +3286,62 @@
     if (logwrapEl) logwrapEl.textContent = "";
   }
 
+  /**
+   * Mengevaluasi kode di dunia utama halaman lewat jembatan pesan.
+   * Kode dijalankan pada konteks halaman (window halaman), bukan realm
+   * content script. Hasilnya datang asinkron lewat handleEvalResult.
+   * @param {string} code - Kode yang akan dievaluasi
+   * @param {object} [opts] - { silent: true } untuk tidak menampilkan hasil
+   */
+  function evalInMainWorld(code, opts) {
+    opts = opts || {};
+    var id = ++evalSeq;
+    var sel = "";
+    try { if (selectedEl) sel = elementSelector(selectedEl); } catch (e) {}
+    pendingEvals[id] = { silent: !!opts.silent };
+    try {
+      window.postMessage({ source: "mdt-eval", id: id, code: code, sel: sel }, "*");
+    } catch (e2) {
+      delete pendingEvals[id];
+      addLog("error", ["Gagal mengirim evaluasi ke konteks halaman:", String(e2)], "");
+      return;
+    }
+    setTimeout(function () {
+      if (!pendingEvals[id]) return;
+      delete pendingEvals[id];
+      addLog("error", ["Evaluasi di konteks halaman tidak merespons (timeout)."], "");
+    }, 5000);
+  }
+
+  /** Menangani hasil evaluasi yang dikirim kembali oleh dunia utama. */
+  function handleEvalResult(data) {
+    var pend = pendingEvals[data.id];
+    if (!pend) return;
+    delete pendingEvals[data.id];
+    if (!data.ok) {
+      addLog("error", [String(data.error || "Galat evaluasi di konteks halaman")], "");
+      return;
+    }
+    if (pend.silent) return;
+    addLog("result", [data.result], "");
+    lastResult = data.result;
+    if (logwrapEl) logwrapEl.scrollTop = logwrapEl.scrollHeight;
+  }
+
   /** Mengevaluasi isi REPL dan menampilkan hasilnya. */
   function runRepl() {
     if (!replEl) return;
     acClose();
     var code = replEl.value;
     if (!code || !code.trim()) return;
+    replEl.value = "";
     addLog("log", ["> " + code], "");
+    /* Utamakan eksekusi di konteks halaman; jatuh ke eval lokal bila
+       jembatan dunia utama tidak tersedia (mis. CSP halaman menolak). */
+    if (mainWorldBridge) {
+      evalInMainWorld(code, { silent: false });
+      return;
+    }
     try {
       var result = evalExpression(code);
       addLog("result", [safeStringify(result)], "");
@@ -2942,7 +3349,6 @@
     } catch (err) {
       addLog("error", [String(err && err.stack ? err.stack : err)], "");
     }
-    replEl.value = "";
     if (logwrapEl) logwrapEl.scrollTop = logwrapEl.scrollHeight;
   }
 
@@ -3282,6 +3688,14 @@
     srcCodeEl.id = "mdt-src-code";
     editor.appendChild(srcCodeEl);
 
+    /* Editor kode untuk mengubah isi berkas halaman (mode Edit). */
+    srcEditTaEl = el("textarea", "mdt-src-edit-ta");
+    srcEditTaEl.id = "mdt-src-edit-ta";
+    srcEditTaEl.setAttribute("spellcheck", "false");
+    srcEditTaEl.style.cssText = "width:100%;min-height:240px;box-sizing:border-box;font:12px/1.5 monospace;background:#1e1e1e;color:#d4d4d4;border:none;outline:none;padding:8px;resize:vertical;";
+    srcEditTaEl.style.display = "none";
+    editor.appendChild(srcEditTaEl);
+
     snippetEditorWrapEl = el("div", "mdt-snip-editor-wrap");
     snippetEditorWrapEl.id = "mdt-snip-editor";
     snippetEditorWrapEl.style.display = "none";
@@ -3329,6 +3743,21 @@
     srcPrettyBtnEl.type = "button";
     srcPrettyBtnEl.addEventListener("click", prettifyCurrentSource);
     sbLeft.appendChild(srcPrettyBtnEl);
+
+    /* Mode Edit: ubah isi berkas sumber, lalu jalankan sebagai skrip. */
+    srcEditBtnEl = el("button", null, "Edit");
+    srcEditBtnEl.id = "mdt-src-editbtn";
+    srcEditBtnEl.type = "button";
+    srcEditBtnEl.setAttribute("title", "Ubah isi berkas sumber");
+    srcEditBtnEl.addEventListener("click", toggleSourceEdit);
+    sbLeft.appendChild(srcEditBtnEl);
+
+    srcRunBtnEl = el("button", null, "Jalankan");
+    srcRunBtnEl.id = "mdt-src-runbtn";
+    srcRunBtnEl.type = "button";
+    srcRunBtnEl.setAttribute("title", "Jalankan kode pada konteks halaman");
+    srcRunBtnEl.addEventListener("click", runCurrentSource);
+    sbLeft.appendChild(srcRunBtnEl);
     var sbRight = el("div", "sb-right");
     srcStatusRightEl = el("span", null, "");
     sbRight.appendChild(srcStatusRightEl);
@@ -3345,6 +3774,10 @@
     /* Kontrol jeda (visual; eksekusi debugger penuh di luar cakupan). */
     var dbgControls = el("div");
     dbgControls.id = "mdt-dbg-controls";
+    /* Tombol disusun sejajar dan membungkus bila sempit (tidak bertumpuk). */
+    dbgControls.style.display = "flex";
+    dbgControls.style.flexWrap = "wrap";
+    dbgControls.style.gap = "6px";
     var ctrlDefs = [
       ["Lanjut", "Lanjutkan eksekusi"],
       ["Masuk", "Masuk ke fungsi"],
@@ -3355,6 +3788,8 @@
       (function (def) {
         var cb = el("button", "mdt-dbg-ctrl", def[0]);
         cb.type = "button";
+        cb.style.flexShrink = "0";
+        cb.style.whiteSpace = "nowrap";
         cb.setAttribute("title", def[1]);
         cb.addEventListener("click", function () {
           setDbgStatus(def[1] + " (demo)");
@@ -3407,7 +3842,28 @@
     return sec;
   }
 
-  /** Mengumpulkan sumber daya skrip/gaya dari halaman. */
+  /** Menambah satu berkas sumber (dipakai skrip/gaya/sumber daya lain). */
+  function addSourceFile(name, type, group, code, url) {
+    sourceFiles.push({ name: name, url: url || "", type: type, code: code, group: group });
+    return sourceFiles[sourceFiles.length - 1];
+  }
+
+  /** Serialisasi isi localStorage/sessionStorage ke JSON. */
+  function webStorageText(store) {
+    var out = {};
+    try {
+      var s = store === "sessionStorage" ? window.sessionStorage : window.localStorage;
+      if (s) {
+        for (var i = 0; i < s.length; i++) {
+          var k = s.key(i);
+          out[k] = s.getItem(k);
+        }
+      }
+    } catch (e) {}
+    return JSON.stringify(out, null, 2);
+  }
+
+  /** Mengumpulkan sumber daya skrip/gaya serta seluruh kategori sumber. */
   function collectSources() {
     sourceFiles = [];
     var i;
@@ -3419,26 +3875,117 @@
         sourceFiles.push({
           name: shortUrl(sc.src),
           url: sc.src,
-          type: /\.m?js(\?|#|$)/i.test(sc.src) ? "js" : "js",
-          code: null
+          type: "js",
+          code: null,
+          group: "Skrip"
         });
       } else if (sc.textContent && sc.textContent.trim()) {
-        sourceFiles.push({ name: "skrip-inline-" + (i + 1) + ".js", url: "", type: "js", code: sc.textContent });
+        sourceFiles.push({ name: "skrip-inline-" + (i + 1) + ".js", url: "", type: "js", code: sc.textContent, group: "Skrip" });
       }
     }
 
     var styles = document.querySelectorAll("style");
     for (i = 0; i < styles.length; i++) {
       if (styles[i].textContent && styles[i].textContent.trim()) {
-        sourceFiles.push({ name: "gaya-inline-" + (i + 1) + ".css", url: "", type: "css", code: styles[i].textContent });
+        sourceFiles.push({ name: "gaya-inline-" + (i + 1) + ".css", url: "", type: "css", code: styles[i].textContent, group: "Gaya" });
       }
     }
 
     var links = document.querySelectorAll('link[rel~="stylesheet"]');
     for (i = 0; i < links.length; i++) {
       if (links[i].href) {
-        sourceFiles.push({ name: shortUrl(links[i].href), url: links[i].href, type: "css", code: null });
+        sourceFiles.push({ name: shortUrl(links[i].href), url: links[i].href, type: "css", code: null, group: "Gaya" });
       }
+    }
+
+    /* --- Penyimpanan lokal & sesi --- */
+    addSourceFile("localStorage.json", "json", "Penyimpanan", webStorageText("localStorage"));
+    addSourceFile("sessionStorage.json", "json", "Penyimpanan", webStorageText("sessionStorage"));
+
+    /* --- Kuki --- */
+    var cookieObj = {};
+    try {
+      var cparts = (document.cookie || "").split(";");
+      for (i = 0; i < cparts.length; i++) {
+        var cidx = cparts[i].indexOf("=");
+        var ck = cidx >= 0 ? cparts[i].slice(0, cidx).trim() : cparts[i].trim();
+        if (ck) cookieObj[ck] = cidx >= 0 ? cparts[i].slice(cidx + 1).trim() : "";
+      }
+    } catch (e) {}
+    addSourceFile("cookies.json", "json", "Kuki", JSON.stringify(cookieObj, null, 2));
+
+    /* --- Iframe --- */
+    var frames = document.querySelectorAll("iframe");
+    var frameList = [];
+    for (i = 0; i < frames.length; i++) {
+      frameList.push({ id: frames[i].id || "", src: frames[i].src || frames[i].getAttribute("src") || "" });
+    }
+    addSourceFile("iframes.json", "json", "Iframe", JSON.stringify(frameList, null, 2));
+
+    /* --- Gambar / video / audio --- */
+    var mediaList = [];
+    var imgs = document.querySelectorAll("img");
+    for (i = 0; i < imgs.length; i++) {
+      mediaList.push({ tipe: "gambar", src: imgs[i].currentSrc || imgs[i].src || "", alt: imgs[i].alt || "" });
+    }
+    var vids = document.querySelectorAll("video");
+    for (i = 0; i < vids.length; i++) {
+      mediaList.push({ tipe: "video", src: vids[i].currentSrc || vids[i].src || "" });
+    }
+    var auds = document.querySelectorAll("audio");
+    for (i = 0; i < auds.length; i++) {
+      mediaList.push({ tipe: "audio", src: auds[i].currentSrc || auds[i].src || "" });
+    }
+    addSourceFile("media.json", "json", "Gambar/Video", JSON.stringify(mediaList, null, 2));
+
+    /* --- Variabel global --- */
+    var globals = [];
+    try {
+      for (var gk in window) {
+        if (Object.prototype.hasOwnProperty.call(window, gk)) globals.push(gk);
+      }
+    } catch (e) {}
+    globals.sort();
+    addSourceFile("variabel-global.json", "json", "Variabel global", JSON.stringify(globals.slice(0, 500), null, 2));
+
+    /* --- WebAssembly --- */
+    var wasmList = [];
+    if (typeof WebAssembly !== "undefined") wasmList.push({ modul: "WebAssembly API", status: "tersedia" });
+    try {
+      if (typeof performance !== "undefined" && performance.getEntriesByType) {
+        var rsrc = performance.getEntriesByType("resource") || [];
+        for (i = 0; i < rsrc.length; i++) {
+          if (/\.wasm(\?|#|$)/i.test(rsrc[i].name || "")) wasmList.push({ berkas: rsrc[i].name });
+        }
+      }
+    } catch (e) {}
+    addSourceFile("wasm.json", "json", "WebAssembly", JSON.stringify(wasmList, null, 2));
+
+    /* --- IndexedDB (daftar dimuat asinkron) --- */
+    collectIndexedDBSources();
+  }
+
+  /** Menambah berkas sumber IndexedDB lalu mengisinya secara asinkron. */
+  function collectIndexedDBSources() {
+    var file = addSourceFile("indexedDB.json", "json", "IndexedDB", "// Memuat daftar database...");
+    if (!window.indexedDB || !indexedDB.databases) {
+      file.code = "// IndexedDB tidak tersedia di peramban ini.";
+      return;
+    }
+    try {
+      var p = indexedDB.databases();
+      if (p && typeof p.then === "function") {
+        p.then(function (dbs) {
+          var arr = [];
+          for (var i = 0; i < dbs.length; i++) arr.push({ nama: dbs[i].name, versi: dbs[i].version });
+          file.code = JSON.stringify(arr, null, 2);
+          if (currentFile && currentFile.file === file) renderSourceCode(file.code, file.type);
+        }).catch(function () {
+          file.code = "// Gagal membaca daftar IndexedDB.";
+        });
+      }
+    } catch (e) {
+      file.code = "// Gagal mengakses IndexedDB.";
     }
   }
 
@@ -3446,13 +3993,17 @@
   function renderSourceNav() {
     if (!srcTreeWrapEl) return;
     srcTreeWrapEl.textContent = "";
-    var groups = { js: [], css: [] };
+    var order = ["Skrip", "Gaya", "Penyimpanan", "Kuki", "Iframe", "Gambar/Video", "Variabel global", "WebAssembly", "IndexedDB"];
+    var groups = {};
     for (var i = 0; i < sourceFiles.length; i++) {
       var f = sourceFiles[i];
-      groups[f.type === "css" ? "css" : "js"].push({ file: f, index: i });
+      var key = f.group || (f.type === "css" ? "Gaya" : "Skrip");
+      if (!groups[key]) groups[key] = [];
+      groups[key].push({ file: f, index: i });
     }
-    appendFileGroup("Skrip", groups.js);
-    appendFileGroup("Gaya", groups.css);
+    for (var g = 0; g < order.length; g++) {
+      if (groups[order[g]]) appendFileGroup(order[g], groups[order[g]]);
+    }
     if (!sourceFiles.length) {
       srcTreeWrapEl.appendChild(el("div", "mdt-dbg-empty", "Tidak ada sumber yang dapat dibaca."));
     }
@@ -3465,7 +4016,7 @@
       (function (item) {
         var node = el("div", "mdt-tree-node");
         node.appendChild(el("span", "mdt-tree-arrow", item.file.url ? "@" : ">"));
-        node.appendChild(el("span", "mdt-tree-icon", item.file.type === "css" ? "css" : "js"));
+        node.appendChild(el("span", "mdt-tree-icon", item.file.type === "css" ? "css" : item.file.type === "json" ? "{}" : "js"));
         node.appendChild(el("span", "mdt-tree-label", item.file.name));
         node.addEventListener("click", function () {
           openSourceFile(item.index);
@@ -3479,6 +4030,7 @@
   function openSourceFile(index) {
     var f = sourceFiles[index];
     if (!f) return;
+    if (srcEditing) exitSourceEdit();
     currentFile = { index: index, file: f, pretty: false };
 
     /* Perbarui tab berkas. */
@@ -3597,10 +4149,69 @@
     }
   }
 
+  /** Keluar dari mode edit kode tanpa menyimpan. */
+  function exitSourceEdit() {
+    srcEditing = false;
+    if (srcEditTaEl) srcEditTaEl.style.display = "none";
+    if (srcCodeEl) srcCodeEl.style.display = "";
+    if (srcEditBtnEl) srcEditBtnEl.textContent = "Edit";
+  }
+
+  /** Membuka/menutup mode edit kode untuk berkas aktif. */
+  function toggleSourceEdit() {
+    if (!currentFile || !currentFile.file) return;
+    if (!srcEditing) {
+      if (currentFile.file.code === null || currentFile.file.code === undefined) return;
+      srcEditTaEl.value = currentFile.file.code;
+      srcEditTaEl.style.display = "block";
+      srcCodeEl.style.display = "none";
+      srcEditing = true;
+      if (srcEditBtnEl) srcEditBtnEl.textContent = "Selesai";
+      try { srcEditTaEl.focus(); } catch (e) {}
+    } else {
+      saveSourceEdit();
+      exitSourceEdit();
+    }
+  }
+
+  /** Menyimpan isi editor kode kembali ke berkas aktif. */
+  function saveSourceEdit() {
+    if (!currentFile || !currentFile.file || !srcEditTaEl) return;
+    currentFile.file.code = srcEditTaEl.value;
+    renderSourceCode(currentFile.file.code, currentFile.file.type);
+  }
+
+  /** Menjalankan kode berkas aktif pada konteks halaman. */
+  function runCurrentSource() {
+    var code = null;
+    if (srcEditing && srcEditTaEl) {
+      code = srcEditTaEl.value;
+      saveSourceEdit();
+    } else if (currentFile && currentFile.file) {
+      code = currentFile.file.code;
+    }
+    if (!code) return;
+    /* Jalankan di konteks halaman bila jembatan aktif, agar kode melihat
+       window halaman dan console.log-nya ikut tertangkap. */
+    if (mainWorldBridge) {
+      evalInMainWorld(code, { silent: true });
+      addLog("info", ["Skrip dijalankan dari editor:", currentFile && currentFile.file ? currentFile.file.name : ""], "");
+      return;
+    }
+    try {
+      var fn = new Function(code);
+      fn();
+      addLog("info", ["Skrip dijalankan dari editor:", currentFile && currentFile.file ? currentFile.file.name : ""], "");
+    } catch (e) {
+      addLog("error", ["Skrip gagal dijalankan:", String(e)], "");
+    }
+  }
+
   /** Bertukar antara tampilan Halaman dan Cuplikan. */
   function switchSrcView(view) {
     if (!srcTreeWrapEl) return;
     if (view === "snippets") {
+      if (srcEditing) exitSourceEdit();
       srcTreeWrapEl.style.display = "none";
       snippetsNavEl.style.display = "";
       srcCodeEl.style.display = "none";
@@ -3622,34 +4233,29 @@
 
   var BUILTIN_SNIPPETS = [
     {
-      id: "b1",
-      name: "Hapus semua cookie",
-      code: "document.cookie.split(';').forEach(function (c) {\n  var name = c.split('=')[0].trim();\n  document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';\n});\nconsole.log('Cookie dibersihkan');"
+      id: "b-border",
+      name: "Semua Batas",
+      code: "if (window.__mdtBorderAll) {\n  Array.prototype.forEach.call(document.querySelectorAll('*'), function (el) {\n    el.style.outline = '';\n  });\n  window.__mdtBorderAll = false;\n  console.log('Semua batas disembunyikan');\n} else {\n  Array.prototype.forEach.call(document.querySelectorAll('*'), function (el) {\n    el.style.outline = '1px solid rgba(244,67,54,.7)';\n  });\n  window.__mdtBorderAll = true;\n  console.log('Semua batas ditampilkan');\n}"
     },
     {
-      id: "b2",
-      name: "Hitung performa navigasi",
-      code: "var n = performance.getEntriesByType('navigation')[0];\nif (n) console.log({\n  dns: Math.round(n.domainLookupEnd - n.domainLookupStart),\n  ttfb: Math.round(n.responseStart - n.startTime),\n  domReady: Math.round(n.domContentLoadedEventEnd),\n  load: Math.round(n.loadEventEnd)\n});"
+      id: "b-refresh",
+      name: "Muat ulang halaman",
+      code: "location.reload();"
     },
     {
-      id: "b3",
-      name: "Sorot grid tata letak",
-      code: "var d = document.createElement('div');\nd.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483640;background-image:linear-gradient(rgba(86,156,214,.25) 1px,transparent 1px),linear-gradient(90deg,rgba(86,156,214,.25) 1px,transparent 1px);background-size:24px 24px;';\nd.id = 'mdt-grid-overlay';\ndocument.body.appendChild(d);\nconsole.log('Grid ditampilkan, klik lagi untuk mengganti');"
+      id: "b-search",
+      name: "Cari teks",
+      code: "var q = window.prompt('Teks yang ingin dicari:', '');\nif (q) {\n  if (window.find) window.find(q);\n  else console.log('Pencarian tidak didukung peramban ini: ' + q);\n}"
     },
     {
-      id: "b4",
-      name: "Ambil semua gambar",
-      code: "var imgs = Array.prototype.map.call(document.images, function (i) { return i.currentSrc || i.src; });\nconsole.log(imgs.length + ' gambar');\nconsole.log(imgs);"
+      id: "b-edit",
+      name: "Edit halaman",
+      code: "var on = document.body.contentEditable === 'true' || document.designMode === 'on';\ndocument.body.contentEditable = on ? 'false' : 'true';\ndocument.designMode = on ? 'off' : 'on';\nconsole.log('Mode edit halaman: ' + (on ? 'nonaktif' : 'aktif'));"
     },
     {
-      id: "b5",
-      name: "Kosongkan localStorage",
-      code: "localStorage.clear();\nconsole.log('localStorage dikosongkan');"
-    },
-    {
-      id: "b6",
-      name: "Garis tepi semua elemen",
-      code: "Array.prototype.forEach.call(document.querySelectorAll('*'), function (e) {\n  e.style.outline = '1px solid rgba(244,71,71,.6)';\n});\nconsole.log('Garis tepi dipasang');"
+      id: "b-fit",
+      name: "Sesuaikan layar",
+      code: "var vp = document.querySelector('meta[name=\"viewport\"]');\nif (!vp) {\n  vp = document.createElement('meta');\n  vp.name = 'viewport';\n  document.head.appendChild(vp);\n}\nvar target = 'width=' + window.innerWidth + ', user-scalable=no';\nvp.content = vp.content === target ? 'width=device-width, initial-scale=1' : target;\nconsole.log('Tampilan disesuaikan dengan layar (' + window.innerWidth + 'px)');"
     }
   ];
 
@@ -3809,6 +4415,13 @@
 
   /** Menjalankan isi cuplikan pada konteks halaman. */
   function runSnippet(snip) {
+    if (!snip) return;
+    /* Utamakan konteks halaman bila jembatan aktif. */
+    if (mainWorldBridge) {
+      evalInMainWorld(snip.code, { silent: true });
+      addLog("info", ["Cuplikan dijalankan:", snip.name], "");
+      return;
+    }
     try {
       var fn = new Function(snip.code);
       fn();
@@ -3857,6 +4470,17 @@
     clearBtn.type = "button";
     clearBtn.addEventListener("click", clearNet);
     tb.appendChild(clearBtn);
+
+    /* Ekspor HAR: seluruh permintaan yang tercatat diunduh sebagai .har. */
+    var harBtn = el("button", "mdt-tbtn", "Ekspor HAR");
+    harBtn.type = "button";
+    harBtn.id = "mdt-net-har";
+    harBtn.style.flexShrink = "0";
+    harBtn.style.whiteSpace = "nowrap";
+    harBtn.setAttribute("title", "Unduh seluruh catatan jaringan sebagai berkas .har");
+    harBtn.addEventListener("click", exportHar);
+    tb.appendChild(harBtn);
+
     netFilterEl = el("input", "mdt-tbinput");
     netFilterEl.setAttribute("placeholder", "Saring URL");
     netFilterEl.addEventListener("input", applyNetFilter);
@@ -3914,8 +4538,9 @@
     netDetailTabsEl.id = "mdt-net-detail-tabs";
     var tabs = [
       ["headers", "Header"],
-      ["payload", "Payload"],
-      ["body", "Body"],
+      ["preview", "Pratinjau"],
+      ["payload", "Muatan"],
+      ["body", "Isi"],
       ["cookies", "Cookie"],
       ["response", "Respons"]
     ];
@@ -4052,13 +4677,15 @@
         type: m.type || "",
         status: m.status || 0,
         dur: m.dur || 0,
+        t0: typeof m.t0 === "number" ? m.t0 : Date.now(),
         size: typeof m.size === "number" ? m.size : -1,
         resHeaders: m.resHeaders || [],
         reqHeaders: m.reqHeaders || [],
         error: m.error || "",
         fromCache: m.fromCache,
         reqBody: typeof m.reqBody === "string" ? m.reqBody : "",
-        resBody: typeof m.resBody === "string" ? m.resBody : "",
+        /* Body respons hanya disimpan bila "tangkap body respons" aktif. */
+        resBody: settings.network.captureBody && typeof m.resBody === "string" ? m.resBody : "",
         resBodyTrunc: !!m.resBodyTrunc
       }
     };
@@ -4107,7 +4734,8 @@
     if (m.reqHeaders) rec.data.reqHeaders = m.reqHeaders;
     if (typeof m.fromCache !== "undefined") rec.data.fromCache = m.fromCache;
     if (typeof m.reqBody === "string") rec.data.reqBody = m.reqBody;
-    if (typeof m.resBody === "string") rec.data.resBody = m.resBody;
+    /* Bila penyimpanan body respons dimatikan, jangan simpan body apa pun. */
+    if (typeof m.resBody === "string") rec.data.resBody = settings.network.captureBody ? m.resBody : "";
     if (typeof m.resBodyTrunc !== "undefined") rec.data.resBodyTrunc = !!m.resBodyTrunc;
 
     updateWaterfalls();
@@ -4191,16 +4819,53 @@
       appendHeaders("Header permintaan", d.reqHeaders);
       appendHeaders("Header respons", d.resHeaders);
     } else if (tab === "payload") {
-      netDetailBodyEl.appendChild(el("div", "mdt-dsec", "Payload permintaan"));
-      appendHeaders("", d.reqHeaders);
-      if (!d.reqHeaders || !d.reqHeaders.length) {
-        netDetailBodyEl.appendChild(el("div", "mdt-style-addprop", "Tidak ada payload yang terdeteksi."));
+      netDetailBodyEl.appendChild(el("div", "mdt-dsec", "Muatan permintaan"));
+      var reqBodyText = typeof d.reqBody === "string" ? d.reqBody : "";
+      if (reqBodyText) {
+        appendBodyBlock(reqBodyText);
+      } else if (d.reqHeaders && d.reqHeaders.length) {
+        appendHeaders("Header permintaan", d.reqHeaders);
+      } else {
+        netDetailBodyEl.appendChild(el("div", "mdt-style-addprop", "Tidak ada muatan yang terdeteksi."));
       }
     } else if (tab === "body") {
       netDetailBodyEl.appendChild(el("div", "mdt-dsec", "Body permintaan"));
       appendBodyBlock(d.reqBody);
       netDetailBodyEl.appendChild(el("div", "mdt-dsec", "Body respons" + (d.resBodyTrunc ? " (terpotong)" : "")));
       appendBodyBlock(d.resBody);
+    } else if (tab === "preview") {
+      netDetailBodyEl.appendChild(el("div", "mdt-dsec", "Pratinjau Konten"));
+      var ctype = "";
+      var resHeaders = d.resHeaders || [];
+      for (var hi = 0; hi < resHeaders.length; hi++) {
+        if (String(resHeaders[hi].name || "").toLowerCase() === "content-type") {
+          ctype = String(resHeaders[hi].value || "").toLowerCase();
+          break;
+        }
+      }
+      var bodyText = typeof d.resBody === "string" ? d.resBody : "";
+      var previewUrl = d.url || "";
+
+      if (ctype.indexOf("image/") >= 0 || /\.(png|jpg|jpeg|gif|svg|webp|ico)(\?.*)?$/i.test(previewUrl)) {
+        var img = el("img");
+        img.style.cssText = "max-width:100%;max-height:300px;display:block;margin:8px 0;border-radius:4px;border:1px solid var(--bdr);";
+        img.src = previewUrl;
+        netDetailBodyEl.appendChild(img);
+      } else if (ctype.indexOf("video/") >= 0 || /\.(mp4|webm|ogg|mov)(\?.*)?$/i.test(previewUrl)) {
+        var vid = el("video");
+        vid.setAttribute("controls", "controls");
+        vid.style.cssText = "max-width:100%;max-height:300px;display:block;margin:8px 0;border-radius:4px;";
+        vid.src = previewUrl;
+        netDetailBodyEl.appendChild(vid);
+      } else if (ctype.indexOf("audio/") >= 0 || /\.(mp3|wav|ogg|aac)(\?.*)?$/i.test(previewUrl)) {
+        var aud = el("audio");
+        aud.setAttribute("controls", "controls");
+        aud.style.cssText = "width:100%;display:block;margin:8px 0;";
+        aud.src = previewUrl;
+        netDetailBodyEl.appendChild(aud);
+      } else {
+        netDetailBodyEl.appendChild(el("div", "mdt-style-addprop", "Tipe konten tidak mendukung pratinjau media (bukan image, video, atau audio). Tipe: " + (ctype || "tidak diketahui")));
+      }
     } else if (tab === "cookies") {
       appendCookies("Cookie permintaan", headerValues(d.reqHeaders, "cookie"), false);
       appendCookies("Cookie respons (Set-Cookie)", headerValues(d.resHeaders, "set-cookie"), true);
@@ -4355,6 +5020,155 @@
     return (n / (1024 * 1024)).toFixed(1) + " MB";
   }
 
+  /* ---------- Ekspor HAR (HTTP Archive 1.2) ---------- */
+
+  /** Mengubah daftar header menjadi bentuk header HAR (tanpa header semu). */
+  function harHeaders(list) {
+    var out = [];
+    if (!list) return out;
+    for (var i = 0; i < list.length; i++) {
+      if (!list[i]) continue;
+      var name = String(list[i].name || "");
+      if (!name || name.charAt(0) === ":") continue;
+      out.push({ name: name, value: String(list[i].value == null ? "" : list[i].value) });
+    }
+    return out;
+  }
+
+  /** Mengubah string cookie menjadi daftar cookie HAR. */
+  function harCookies(values, firstPairOnly) {
+    var out = [];
+    if (!values) return out;
+    for (var i = 0; i < values.length; i++) {
+      var pairs = firstPairOnly ? [String(values[i]).split(";")[0]] : String(values[i]).split(";");
+      for (var j = 0; j < pairs.length; j++) {
+        var p = pairs[j].trim();
+        if (!p) continue;
+        var eq = p.indexOf("=");
+        if (eq < 0) continue;
+        out.push({ name: p.slice(0, eq).trim(), value: p.slice(eq + 1) });
+      }
+    }
+    return out;
+  }
+
+  /** Mengurai query string URL menjadi daftar {name,value} HAR. */
+  function harQuery(u) {
+    var out = [];
+    try {
+      var q = String(u).split("#")[0].split("?")[1];
+      if (!q) return out;
+      var parts = q.split("&");
+      for (var i = 0; i < parts.length; i++) {
+        if (!parts[i]) continue;
+        var eq = parts[i].indexOf("=");
+        out.push({
+          name: decodeURIComponent(eq >= 0 ? parts[i].slice(0, eq) : parts[i]),
+          value: decodeURIComponent(eq >= 0 ? parts[i].slice(eq + 1) : "")
+        });
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  /** Menebak MIME type respons dari header atau ekstensi URL. */
+  function harMimeType(headers, url) {
+    var ct = headerValues(headers, "content-type")[0];
+    if (ct) return String(ct).split(";")[0].trim();
+    if (/\.json(\?|#|$)/i.test(url)) return "application/json";
+    if (/\.(png|jpg|jpeg|gif|svg|webp|ico)(\?|#|$)/i.test(url)) return "image/*";
+    if (/\.css(\?|#|$)/i.test(url)) return "text/css";
+    if (/\.m?js(\?|#|$)/i.test(url)) return "application/javascript";
+    if (/\.html?(\?|#|$)/i.test(url)) return "text/html";
+    return "application/octet-stream";
+  }
+
+  /** Menyusun objek HAR (HTTP Archive 1.2) dari seluruh catatan jaringan. */
+  function buildHar() {
+    var entries = [];
+    var now = Date.now();
+    for (var i = 0; i < netOrder.length; i++) {
+      var rec = netRows[netOrder[i]];
+      if (!rec) continue;
+      var d = rec.data || {};
+      var startTime = typeof d.t0 === "number" ? d.t0 : now;
+      var dur = typeof d.dur === "number" ? d.dur : 0;
+      var reqHeaders = harHeaders(d.reqHeaders);
+      var resHeaders = harHeaders(d.resHeaders);
+      entries.push({
+        startedDateTime: new Date(startTime).toISOString(),
+        time: dur,
+        request: {
+          method: (d.method || "GET").toUpperCase(),
+          url: d.url || "",
+          httpVersion: "HTTP/1.1",
+          cookies: harCookies(headerValues(d.reqHeaders, "cookie")),
+          headers: reqHeaders,
+          queryString: harQuery(d.url),
+          headersSize: -1,
+          bodySize: typeof d.reqBody === "string" ? d.reqBody.length : 0
+        },
+        response: {
+          status: d.error ? 0 : (d.status || 0),
+          statusText: d.statusText || (d.error || ""),
+          httpVersion: "HTTP/1.1",
+          cookies: harCookies(headerValues(d.resHeaders, "set-cookie"), true),
+          headers: resHeaders,
+          content: {
+            size: typeof d.size === "number" ? d.size : -1,
+            mimeType: harMimeType(d.resHeaders, d.url),
+            text: typeof d.resBody === "string" ? d.resBody : ""
+          },
+          redirectURL: headerValues(d.resHeaders, "location")[0] || "",
+          headersSize: -1,
+          bodySize: typeof d.size === "number" ? d.size : -1
+        },
+        cache: {},
+        timings: { send: 0, wait: dur, receive: 0 }
+      });
+    }
+    return {
+      log: {
+        version: "1.2",
+        creator: { name: "NT DevTools", version: "1.1.0" },
+        browser: { name: navigator.userAgent || "", version: "" },
+        entries: entries
+      }
+    };
+  }
+
+  /** Mengunduh berkas teks melalui Blob + tautan unduhan. */
+  function downloadTextFile(name, text, mime) {
+    try {
+      var blob = new Blob([text], { type: mime || "application/octet-stream" });
+      var url = URL.createObjectURL(blob);
+      var a = el("a");
+      a.href = url;
+      a.download = name;
+      a.style.display = "none";
+      document.documentElement.appendChild(a);
+      a.click();
+      setTimeout(function () {
+        try { URL.revokeObjectURL(url); } catch (e) {}
+        if (a.parentNode) a.parentNode.removeChild(a);
+      }, 0);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** Menangani tombol "Ekspor HAR". */
+  function exportHar() {
+    var har = buildHar();
+    var text = JSON.stringify(har, null, 2);
+    if (!downloadTextFile("ntdevtools-" + Date.now() + ".har", text, "application/json")) {
+      /* Cadangan: salin isi HAR ke clipboard bila unduhan tidak didukung. */
+      copyText(text);
+    }
+    addLog("info", ["HAR diekspor: " + har.log.entries.length + " entri"], "");
+  }
+
   /* ==================================================================
      BAGIAN 13 - Panel KINERJA
      ================================================================== */
@@ -4392,6 +5206,18 @@
     pageCard.appendChild(el("h4", null, "Halaman"));
     pageCard.setAttribute("data-perf", "page");
     perfScrollEl.appendChild(pageCard);
+
+    /* Kartu waktu */
+    var timeCard = el("div", "mdt-pcard");
+    timeCard.appendChild(el("h4", null, "Waktu"));
+    timeCard.setAttribute("data-perf", "time");
+    perfScrollEl.appendChild(timeCard);
+
+    /* Kartu informasi CPU */
+    var cpuCard = el("div", "mdt-pcard");
+    cpuCard.appendChild(el("h4", null, "Informasi CPU"));
+    cpuCard.setAttribute("data-perf", "cpu");
+    perfScrollEl.appendChild(cpuCard);
 
     panel.appendChild(perfScrollEl);
     renderPerfCards();
@@ -4444,6 +5270,37 @@
       pageCard.appendChild(pmRow("Gambar", String(document.images ? document.images.length : 0)));
       pageCard.appendChild(pmRow("Skrip", String(document.scripts ? document.scripts.length : 0)));
       pageCard.appendChild(pmRow("Lembar gaya", String(document.styleSheets ? document.styleSheets.length : 0)));
+    }
+
+    /* Waktu */
+    var timeCard = perfScrollEl.querySelector('[data-perf="time"]');
+    if (timeCard) {
+      clearSpecial(timeCard);
+      var now = new Date();
+      timeCard.appendChild(pmRow("Waktu lokal", now.toLocaleString()));
+      var zone = "-";
+      try {
+        if (typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+          zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "-";
+        }
+      } catch (e) {}
+      timeCard.appendChild(pmRow("Zona waktu", zone));
+      var upt = "-";
+      try {
+        if (typeof performance !== "undefined" && performance.now) upt = Math.round(performance.now()) + " ms";
+      } catch (e) {}
+      timeCard.appendChild(pmRow("Aktif halaman", upt));
+    }
+
+    /* Informasi CPU */
+    var cpuCard = perfScrollEl.querySelector('[data-perf="cpu"]');
+    if (cpuCard) {
+      clearSpecial(cpuCard);
+      cpuCard.appendChild(pmRow("Jumlah inti logis", navigator.hardwareConcurrency ? String(navigator.hardwareConcurrency) : "tidak diketahui"));
+      cpuCard.appendChild(pmRow("Memori perangkat", navigator.deviceMemory ? navigator.deviceMemory + " GB" : "tidak diketahui"));
+      cpuCard.appendChild(pmRow("Platform", navigator.platform || "-"));
+      var arch = navigator.userAgentData && navigator.userAgentData.architecture ? navigator.userAgentData.architecture : "tidak tersedia";
+      cpuCard.appendChild(pmRow("Arsitektur", arch));
     }
   }
 
@@ -4525,7 +5382,8 @@
     ["sessionStorage", "sessionStorage"],
     ["cookies", "Cookie"],
     ["indexedDB", "IndexedDB"],
-    ["cache", "Cache Storage"]
+    ["cache", "Cache Storage"],
+    ["wasm", "WebAssembly (Wasm)"]
   ];
 
   function buildStorage(panel) {
@@ -4617,6 +5475,9 @@
     } else if (appCurrentStore === "cache") {
       readCaches();
       return;
+    } else if (appCurrentStore === "wasm") {
+      readWasmModules();
+      return;
     }
     paintAppTable();
   }
@@ -4701,7 +5562,29 @@
     });
   }
 
-  /** Menampilkan pesan kosong pada area tabel. */
+  /** Membaca modul WebAssembly (Wasm) yang terdeteksi. */
+  function readWasmModules() {
+    appData = [];
+    var hasWasm = typeof WebAssembly !== "undefined";
+    if (!hasWasm) {
+      renderAppEmpty("WebAssembly", "WebAssembly tidak didukung pada browser ini.");
+      return;
+    }
+    appData.push({ key: "WebAssembly API", value: "Tersedia (window.WebAssembly)" });
+    if (typeof window.performance !== "undefined" && window.performance.getEntriesByType) {
+      var entries = window.performance.getEntriesByType("resource");
+      for (var i = 0; i < entries.length; i++) {
+        var name = entries[i].name || "";
+        if (/\.wasm(\?.*)?$/i.test(name)) {
+          appData.push({ key: "Modul Wasm", value: name });
+        }
+      }
+    }
+    if (appData.length === 1) {
+      appData.push({ key: "Status Wasm", value: "Tidak ada berkas .wasm yang terdeteksi di resource timing saat ini." });
+    }
+    paintAppTable();
+  }
   function renderAppEmpty(title, sub) {
     appTableWrapEl.textContent = "";
     var box = el("div", "mdt-app-empty");
@@ -4814,8 +5697,207 @@
   }
 
   /* ==================================================================
-     BAGIAN 15 - Panel PERANGKAT (ua)
+     BAGIAN 14b - Panel PETA (OpenStreetMap + IP Publik)
      ================================================================== */
+
+  var mapScrollEl = null;
+  var mapInfoEl = null;
+  var mapFrameEl = null;
+
+  function buildMapPanel(panel) {
+    mapScrollEl = el("div");
+    mapScrollEl.id = "mdt-map-scroll";
+    mapScrollEl.style.cssText = "height:100%;overflow:auto;padding:12px;box-sizing:border-box;display:flex;flex-direction:column;gap:12px;font:12px var(--mono, monospace);color:var(--wht,#e6e6e8);";
+
+    var topBar = el("div");
+    topBar.style.cssText = "display:flex;gap:8px;align-items:center;";
+    var refreshBtn = el("button", "mdt-app-tbtn", "Muat Ulang IP & Peta");
+    refreshBtn.type = "button";
+    refreshBtn.addEventListener("click", loadPublicIPAndMap);
+    topBar.appendChild(refreshBtn);
+    mapScrollEl.appendChild(topBar);
+
+    mapInfoEl = el("div", "mdt-pcard");
+    mapInfoEl.style.cssText = "padding:10px;background:var(--bg1,#242428);border:1px solid var(--bdr,rgba(255,255,255,.09));border-radius:var(--r,4px);display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;";
+    mapInfoEl.appendChild(el("div", null, "Memuat informasi IP publik..."));
+    mapScrollEl.appendChild(mapInfoEl);
+
+    var mapWrap = el("div");
+    mapWrap.style.cssText = "flex:1;min-height:280px;position:relative;border:1px solid var(--bdr,rgba(255,255,255,.09));border-radius:var(--r,4px);overflow:hidden;background:var(--bg1,#242428);";
+    mapFrameEl = el("iframe");
+    mapFrameEl.style.cssText = "width:100%;height:100%;border:none;";
+    mapFrameEl.src = "https://www.openstreetmap.org/export/embed.html?bbox=95.0,-11.0,141.0,6.0&layer=mapnik";
+    mapWrap.appendChild(mapFrameEl);
+    mapScrollEl.appendChild(mapWrap);
+
+    panel.appendChild(mapScrollEl);
+    loadPublicIPAndMap();
+  }
+
+  function refreshMapPanel() {
+    loadPublicIPAndMap();
+  }
+
+  function loadPublicIPAndMap() {
+    if (!mapInfoEl || !mapFrameEl) return;
+    mapInfoEl.textContent = "";
+    mapInfoEl.appendChild(el("div", null, "Menghubungi layanan IP..."));
+
+    var apiUrl = "https://ipapi.co/json/";
+    fetch(apiUrl, { mode: "cors" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        renderMapData(data.ip || "-", data.city || "-", data.country_name || "-", data.org || "-", data.latitude, data.longitude);
+      })
+      .catch(function () {
+        /* Fallback ke ipify + ipinfo */
+        fetch("https://api64.ipify.org?format=json")
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            var ip = d.ip || "-";
+            fetch("https://ipinfo.io/" + ip + "/json")
+              .then(function (r2) { return r2.json(); })
+              .then(function (d2) {
+                var loc = (d2.loc || "").split(",");
+                renderMapData(ip, d2.city || "-", d2.country || "-", d2.org || "-", loc[0] ? parseFloat(loc[0]) : null, loc[1] ? parseFloat(loc[1]) : null);
+              })
+              .catch(function () {
+                renderMapData(ip, "-", "-", "-", null, null);
+              });
+          })
+          .catch(function () {
+            mapInfoEl.textContent = "";
+            mapInfoEl.appendChild(el("div", null, "Gagal mengambil data IP publik. Pastikan koneksi internet aktif."));
+          });
+      });
+  }
+
+  function renderMapData(ip, city, country, isp, lat, lon) {
+    if (!mapInfoEl || !mapFrameEl) return;
+    mapInfoEl.textContent = "";
+
+    var items = [
+      ["IP Publik", ip],
+      ["Kota", city],
+      ["Negara", country],
+      ["ISP / Organisasi", isp]
+    ];
+    for (var i = 0; i < items.length; i++) {
+      var box = el("div");
+      box.style.cssText = "display:flex;flex-direction:column;gap:2px;";
+      box.appendChild(el("span", "mdt-uaval", items[i][0]));
+      var val = el("strong", null, items[i][1]);
+      box.appendChild(val);
+      mapInfoEl.appendChild(box);
+    }
+
+    if (lat !== null && lon !== null && !isNaN(lat) && !isNaN(lon)) {
+      var delta = 0.05;
+      var bbox = (lon - delta) + "," + (lat - delta) + "," + (lon + delta) + "," + (lat + delta);
+      mapFrameEl.src = "https://www.openstreetmap.org/export/embed.html?bbox=" + bbox + "&layer=mapnik&marker=" + lat + "," + lon;
+    }
+  }
+
+  /* ==================================================================
+     BAGIAN 14c - Panel WAKTU (Timing)
+     ================================================================== */
+
+  var timingScrollEl = null;
+
+  function buildTimingPanel(panel) {
+    timingScrollEl = el("div");
+    timingScrollEl.id = "mdt-timing-scroll";
+    timingScrollEl.style.cssText = "height:100%;overflow:auto;padding:12px;box-sizing:border-box;display:flex;flex-direction:column;gap:12px;font:12px var(--mono, monospace);color:var(--wht,#e6e6e8);";
+
+    var topBar = el("div");
+    topBar.style.cssText = "display:flex;gap:8px;align-items:center;";
+    var refreshBtn = el("button", "mdt-app-tbtn", "Muat Ulang Metrik Waktu");
+    refreshBtn.type = "button";
+    refreshBtn.addEventListener("click", renderTimingData);
+    topBar.appendChild(refreshBtn);
+    timingScrollEl.appendChild(topBar);
+
+    var tableWrap = el("div", "mdt-pcard");
+    tableWrap.style.cssText = "padding:0;overflow:hidden;border:1px solid var(--bdr,rgba(255,255,255,.09));border-radius:var(--r,4px);background:var(--bg1,#242428);";
+    tableWrap.id = "mdt-timing-table-wrap";
+    timingScrollEl.appendChild(tableWrap);
+
+    panel.appendChild(timingScrollEl);
+    renderTimingData();
+  }
+
+  function refreshTimingPanel() {
+    renderTimingData();
+  }
+
+  function renderTimingData() {
+    var wrap = document.getElementById("mdt-timing-table-wrap");
+    if (!wrap) return;
+    wrap.textContent = "";
+
+    var perf = window.performance;
+    if (!perf) {
+      wrap.appendChild(el("div", null, "Performance API tidak didukung."));
+      return;
+    }
+
+    var nav = null;
+    if (perf.getEntriesByType) {
+      var entries = perf.getEntriesByType("navigation");
+      if (entries && entries.length > 0) nav = entries[0];
+    }
+    var timing = perf.timing || null;
+
+    var rows = [];
+    if (nav) {
+      rows.push(["DNS Lookup", (nav.domainLookupEnd - nav.domainLookupStart).toFixed(2) + " ms"]);
+      rows.push(["TCP Handshake", (nav.connectEnd - nav.connectStart).toFixed(2) + " ms"]);
+      rows.push(["Request Time", (nav.responseStart - nav.requestStart).toFixed(2) + " ms"]);
+      rows.push(["Response Time", (nav.responseEnd - nav.responseStart).toFixed(2) + " ms"]);
+      rows.push(["DOM Interactive", nav.domInteractive ? nav.domInteractive.toFixed(2) + " ms" : (nav.domInteractive - nav.startTime).toFixed(2) + " ms"]);
+      rows.push(["Complete (Load Event)", nav.loadEventEnd ? (nav.loadEventEnd - nav.startTime).toFixed(2) + " ms" : "-"]);
+      rows.push(["Transfer Size", nav.transferSize ? (nav.transferSize / 1024).toFixed(2) + " KB" : "tidak tersedia"]);
+    } else if (timing) {
+      var t0 = timing.navigationStart || timing.fetchStart || 0;
+      rows.push(["DNS Lookup", (timing.domainLookupEnd - timing.domainLookupStart) + " ms"]);
+      rows.push(["TCP Handshake", (timing.connectEnd - timing.connectStart) + " ms"]);
+      rows.push(["Request Time", (timing.responseStart - timing.requestStart) + " ms"]);
+      rows.push(["Response Time", (timing.responseEnd - timing.responseStart) + " ms"]);
+      rows.push(["DOM Interactive", (timing.domInteractive - t0) + " ms"]);
+      rows.push(["Complete (Load Event)", timing.loadEventEnd ? (timing.loadEventEnd - t0) + " ms" : "-"]);
+    } else {
+      wrap.appendChild(el("div", null, "Data navigasi tidak tersedia."));
+      return;
+    }
+
+    var table = el("table");
+    table.style.cssText = "width:100%;border-collapse:collapse;text-align:left;";
+    var thead = el("thead");
+    thead.style.cssText = "background:var(--bg2,#2c2c32);border-bottom:1px solid var(--bdr,rgba(255,255,255,.09));";
+    var thr = el("tr");
+    thr.appendChild(el("th", null, "Metrik Navigasi"));
+    thr.appendChild(el("th", null, "Durasi / Waktu"));
+    thead.appendChild(thr);
+    table.appendChild(thead);
+
+    var tbody = el("tbody");
+    for (var i = 0; i < rows.length; i++) {
+      var tr = el("tr");
+      tr.style.cssText = "border-bottom:1px solid var(--bdr-soft,rgba(255,255,255,.055));";
+      var td1 = el("td", null, rows[i][0]);
+      td1.style.cssText = "padding:8px 12px;";
+      var td2 = el("td", null, rows[i][1]);
+      td2.style.cssText = "padding:8px 12px;color:var(--acc,#569cd6);font-weight:bold;";
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  }
 
   function buildDevice(panel) {
     uaScrollEl = el("div");
@@ -4878,108 +5960,15 @@
     var about = el("div", "mdt-pcard mdt-about-card");
     about.appendChild(el("h4", null, "Tentang"));
     about.appendChild(pmRow("Aplikasi", "NT DevTools"));
-    about.appendChild(pmRow("Versi", "1.0.0"));
+    about.appendChild(pmRow("Versi", "1.1.0"));
     about.appendChild(pmRow("Deskripsi", "Konsol pengembang web untuk debugging dan inspeksi website di Android (Firefox)."));
     about.appendChild(pmRow("Penulis", "NT Dev"));
     about.appendChild(pmLink("GitHub penulis", "https://github.com/nt-portal", "nt-portal"));
     about.appendChild(pmRow("Lisensi", "MIT"));
     about.appendChild(pmLink("Sumber", "https://github.com/nt-portal/NTDev-Tools.git", "nt-portal/NTDev-Tools"));
-    about.appendChild(pmRow("Kredit", "Terinspirasi Eruda"));
-    about.appendChild(pmLink("Eruda", "https://github.com/liriliri/eruda", "liriliri/eruda"));
     aboutScrollEl.appendChild(about);
 
-    /* Panduan singkat - mempertahankan langkah pemakaian panel lama. */
-    aboutScrollEl.appendChild(el("div", "mdt-about-section-title", "Panduan singkat"));
-    var steps = el("div", "mdt-guide-steps");
-    var defs = [
-      ["Buka dan tutup panel", "Tab", "Gunakan ikon ekstensi di bilah alat, atau tombol mengambang (FAB) di kanan bawah bila panel tertutup. Tombol Tutup ada di paling kanan topbar."],
-      ["Inspeksi elemen (Elemen)", "Tab", "Tekan tombol Pilih lalu sentuh elemen di halaman untuk memilihnya. Pohon DOM, breadcrumb, gaya Styles, dan Computed akan mengikuti elemen terpilih."],
-      ["Menjalankan kode (Konsol)", "Tab", "Semua console.log/info/warn/error tampil di sini. Tulis ekspresi di baris REPL di bawah lalu Enter. Gunakan $0 untuk elemen terpilih."],
-      ["Melihat sumber (Sumber)", "Tab", "Daftar skrip dan gaya halaman ada di kiri. Tombol Perindah merapikan kode. Sub-tab Cuplikan menyimpan skrip siap jalan."],
-      ["Memantau jaringan (Jaringan)", "Tab", "Permintaan HTTP/HTTPS tampil sebagai baris. Klik satu baris untuk melihat Header, Payload, dan Respons."],
-      ["Mengukur kinerja (Kinerja)", "Tab", "Meter FPS berjalan saat kartu dibuka, disertai metrik navigasi, memori, dan jumlah node DOM."],
-      ["Menyimpan data (Aplikasi)", "Tab", "Telusuri localStorage, sessionStorage, cookie, IndexedDB, dan Cache Storage. Hapus kunci satu per satu atau seluruhnya."],
-      ["Mengenali perangkat (Perangkat)", "Tab", "Ringkasan UA, platform, bahasa, resolusi, DPR, orientasi, koneksi, CPU, memori, dan status daring."]
-    ];
-
-    for (var i = 0; i < defs.length; i++) {
-      steps.appendChild(makeGuideStep(i + 1, defs[i][0], defs[i][1], defs[i][2]));
-    }
-    aboutScrollEl.appendChild(steps);
-
-    /* Progres langkah. */
-    loadGuideProgress();
-    var prog = el("div", "mdt-guide-progress");
-    prog.appendChild(el("div", "mdt-guide-prog-label", "Progres eksplorasi modul"));
-    var track = el("div", "mdt-guide-prog-bar");
-    var fill = el("div", "mdt-guide-prog-fill");
-    fill.id = "mdt-guide-prog-fill";
-    track.appendChild(fill);
-    prog.appendChild(track);
-    aboutScrollEl.appendChild(prog);
-    updateGuideProgress();
-
     panel.appendChild(aboutScrollEl);
-  }
-
-  /** Membuat satu langkah panduan yang bisa dibuka-tutup. */
-  function makeGuideStep(num, title, tag, desc) {
-    var step = el("div", "mdt-guide-step");
-    step.setAttribute("data-guide", String(num));
-
-    var hdr = el("div", "mdt-guide-step-hdr");
-    hdr.appendChild(el("span", "mdt-guide-step-num", String(num)));
-    hdr.appendChild(el("span", "mdt-guide-step-title", title));
-    var tagEl = el("span", "mdt-guide-step-tag", tag);
-    hdr.appendChild(tagEl);
-    hdr.appendChild(el("span", "mdt-guide-step-arrow", "+"));
-    step.appendChild(hdr);
-
-    var body = el("div", "mdt-guide-step-body");
-    body.appendChild(el("div", "mdt-guide-desc", desc));
-    var hint = el("div", "mdt-guide-tip");
-    hint.appendChild(el("span", "mdt-guide-tip-icon", "i"));
-    hint.appendChild(el("span", null, "Tip: modul dapat diakses kapan pun dari topbar."));
-    body.appendChild(hint);
-    step.appendChild(body);
-
-    hdr.addEventListener("click", function () {
-      var open = step.classList.toggle("open");
-      var arrow = hdr.querySelector(".mdt-guide-step-arrow");
-      if (arrow) arrow.textContent = open ? "-" : "+";
-      if (open) {
-        guideDone[num] = true;
-        persistGuideProgress();
-        updateGuideProgress();
-      }
-    });
-
-    return step;
-  }
-
-  function guideKey() {
-    return "mdt_guide_progress_v1";
-  }
-  function loadGuideProgress() {
-    try {
-      var raw = localStorage.getItem(guideKey());
-      if (raw) guideDone = JSON.parse(raw) || {};
-    } catch (e) {
-      guideDone = {};
-    }
-  }
-  function persistGuideProgress() {
-    try {
-      localStorage.setItem(guideKey(), JSON.stringify(guideDone));
-    } catch (e) {}
-  }
-  function updateGuideProgress() {
-    var fill = document.getElementById("mdt-guide-prog-fill");
-    if (!fill) return;
-    var total = 8;
-    var done = 0;
-    for (var k in guideDone) if (Object.prototype.hasOwnProperty.call(guideDone, k) && guideDone[k]) done++;
-    fill.style.width = Math.min(100, Math.round((done / total) * 100)) + "%";
   }
 
   /* ==================================================================
@@ -5062,29 +6051,36 @@
     /* --- 1. TAMPILAN --- */
     var gTampil = settingsGroup("Tampilan");
 
-    /* Tema: kendali bersegmen Gelap / Terang. */
+    /* Tema: kendali bersegmen Bawaan Sistem / Gelap / Terang. */
     var themeRow = settingsRow("Tema");
     var seg = el("div", "mdt-seg");
+    var btnAuto = el("button", "mdt-seg-btn", "Bawaan Sistem");
     var btnDark = el("button", "mdt-seg-btn", "Gelap");
     var btnLight = el("button", "mdt-seg-btn", "Terang");
+    btnAuto.type = "button";
     btnDark.type = "button";
     btnLight.type = "button";
     function markTheme() {
+      btnAuto.classList.toggle("on", settings.theme === "system");
       btnDark.classList.toggle("on", settings.theme === "dark");
       btnLight.classList.toggle("on", settings.theme === "light");
     }
-    btnDark.addEventListener("click", function () {
-      settings.theme = "dark";
+    function pickTheme(theme) {
+      settings.theme = theme;
       markTheme();
       applySettings();
       saveSettings();
+    }
+    btnAuto.addEventListener("click", function () {
+      pickTheme("system");
+    });
+    btnDark.addEventListener("click", function () {
+      pickTheme("dark");
     });
     btnLight.addEventListener("click", function () {
-      settings.theme = "light";
-      markTheme();
-      applySettings();
-      saveSettings();
+      pickTheme("light");
     });
+    seg.appendChild(btnAuto);
     seg.appendChild(btnDark);
     seg.appendChild(btnLight);
     themeRow.appendChild(seg);
@@ -5244,6 +6240,8 @@
       if (settingsEls.network && settingsEls.network.captureBody) {
         settingsEls.network.captureBody.input.checked = !!settings.network.captureBody;
       }
+      /* Selaraskan juga baris pengaturan inline konsol + tombol regex. */
+      syncConsoleSettingsUI();
     } catch (e) {
       /* abaikan bila antarmuka belum siap */
     }
@@ -5296,6 +6294,10 @@
 
       /* Selaraskan dengan browser.storage.local bila isinya berbeda. */
       loadSettingsAsync();
+      /* Dengarkan perubahan pengaturan dari konteks lain / reset. */
+      watchSettingsStorage();
+      /* Ikuti perubahan skema warna sistem untuk tema "Bawaan Sistem". */
+      watchSystemTheme();
       syncSettingsUI();
     } catch (e) {
       /* Jangan sampai kesalahan kecil merusak halaman. */

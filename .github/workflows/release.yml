@@ -1,0 +1,49 @@
+name: Release NT DevTools
+
+# Hanya berjalan pada push ke branch main.
+on:
+  push:
+    branches:
+      - main
+
+# Diperlukan agar langkah rilis boleh membuat tag dan mempublikasikan Release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Baca versi dari manifest.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versi add-on: $VERSION"
+
+      - name: Bangun berkas ZIP add-on
+        run: |
+          bash build.sh
+          test -f test/ntdev-tools.zip
+
+      - name: Buat tag git baru dan publikasikan Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: Release v${{ steps.version.outputs.value }}
+          files: test/ntdev-tools.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
