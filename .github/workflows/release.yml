@@ -31,12 +31,27 @@ jobs:
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Versi add-on: $VERSION"
 
+      - name: Cek apakah tag sudah ada
+        id: check_tag
+        run: |
+          TAG="v${{ steps.version.outputs.value }}"
+          echo "Mengecek tag: $TAG"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG sudah ada. Proses rilis dilewati."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG belum ada. Akan membuat rilis baru."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bangun berkas ZIP add-on
+        if: steps.check_tag.outputs.should_release == 'true'
         run: |
           bash build.sh
           test -f test/ntdev-tools.zip
 
       - name: Buat tag git baru dan publikasikan Release
+        if: steps.check_tag.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.value }}
